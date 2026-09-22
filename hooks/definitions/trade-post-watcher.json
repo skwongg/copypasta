@@ -3,7 +3,7 @@
   "id": "trade-post-watcher",
   "enabled": true,
   "script_path": "~/hooks/scripts/trade-post-watcher.sh",
-  "prompt": "You relay time-sensitive options trade alerts to Silas. The polling script just detected NEW posts from @CassyTrades, @clintoptions, @capricekayem, and/or @spylieu; the wake payload is JSON with an \"alerts\" array (each: handle, text, url, type=entry|exit, posted_at).\n\nFor each alert: (1) confirm the text really is a trade entry (ticker + strike + calls/puts, e.g. \"$MSFT 510 CALLS.4\") or an exit/update (gain % like \"+100%\", or words like runners/sold/stopped/trim) — discard hype, promos, livestream announcements, or general commentary. (2) In your execute summary, write one short chat-ready alert per qualifying post: the trader's handle, ENTRY or EXIT/UPDATE, the trade detail (ticker, strike, calls/puts, premium, or gain %), and the post URL. Keep each alert to 2-3 lines so it can go straight to chat. If none of the payload posts qualify, say so plainly and do not invent an alert.",
+  "prompt": "You relay time-sensitive options trade alerts to Silas. The polling script just detected NEW posts from @CassyTrades, @clintoptions, @capricekayem, and/or @spylieu; the wake payload is JSON with an \"alerts\" array (each: handle, text, url, type=entry|exit, posted_at).\n\nFor each alert: (1) confirm the text really is a trade entry (ticker + strike + calls/puts, e.g. \"$MSFT 510 CALLS.4\") or an exit/update (gain % like \"+100%\", or words like runners/sold/stopped/trim) \u2014 discard hype, promos, livestream announcements, or general commentary. (2) In your execute summary, write one short chat-ready alert per qualifying post: the trader's handle, ENTRY or EXIT/UPDATE, the trade detail (ticker, strike, calls/puts, premium, or gain %), and the post URL. Keep each alert to 2-3 lines so it can go straight to chat. If none of the payload posts qualify, say so plainly and do not invent an alert.\n\nDashboard push (only if at least one alert above qualified as a real entry/exit \u2014 skip entirely otherwise; this takes seconds and must not delay the alerts): run `python3 ~/workspace/trade-watch/push_dashboard_cloudflare.py` (rebuilds ~/workspace/trade-dashboard-source/trades.json from the trade log, which already includes these new posts, and deploys it to the tail-trades Cloudflare Pages site \u2014 the dashboard at https://tail-trades.pages.dev picks it up live; the push script skips itself when nothing changed). End your summary with one line: \"Dashboard updated.\"",
   "poll_interval_secs": 60,
   "script_timeout_secs": 180,
   "delivery": {
@@ -12,5 +12,5 @@
   },
   "presentation_locale": "en-US",
   "created_at_ms": 1789423618967,
-  "updated_at_ms": 1790086291110
+  "updated_at_ms": 1790101672941
 }

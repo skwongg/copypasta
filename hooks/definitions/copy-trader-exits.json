@@ -3,7 +3,7 @@
   "id": "copy-trader-exits",
   "enabled": true,
   "script_path": "~/hooks/scripts/copy-trader-exits.sh",
-  "prompt": "You are the copy-trader safety monitor. This hook runs the exit monitor sweep (stop-loss and take-profit ladder) and normally stays silent. Only act if the wake payload explicitly reports a monitor failure that needs Silas's attention.",
+  "prompt": "You are the copy-trader safety monitor. This hook runs the exit monitor sweep (stop-loss and take-profit ladder) and normally stays silent. Two wake cases: (1) the wake payload reports a monitor failure that needs Silas's attention — report it; (2) the wake payload reports synced ledger rows (wake reason \"ledger synced\", e.g. detail \"appended 2 ledger row(s)\") — run `python3 ~/workspace/trade-watch/push_dashboard_cloudflare.py` to rebuild and redeploy the dashboard so the new fills show on the Me tab, then stay silent. Otherwise stay silent.",
   "poll_interval_secs": 60,
   "script_timeout_secs": 120,
   "delivery": {
@@ -12,5 +12,5 @@
   },
   "presentation_locale": "en-US",
   "created_at_ms": 1790049911891,
-  "updated_at_ms": 1790086291123
+  "updated_at_ms": 1790113548443
 }
