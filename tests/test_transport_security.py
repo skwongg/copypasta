@@ -222,6 +222,45 @@ class TransportSecurity(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(mcp.MCPError):
                 mcp.MCPClient.normalize_order(data)
 
+    def test_parse_int_accepts_broker_decimal_quantities(self):
+        # Live broker renders integral quantities as decimal strings ("1.00000").
+        self.assertEqual(mcp._parse_int("1.00000"), 1)
+        self.assertEqual(mcp._parse_int("10.0"), 10)
+        self.assertEqual(mcp._parse_int("1"), 1)
+        self.assertEqual(mcp._parse_int(1), 1)
+        for bad in ("1.5", "1.00001", "", "abc", "1e3", "-1", " ", None, 1.0, True):
+            with self.subTest(bad=bad), self.assertRaises(mcp.MCPError):
+                mcp._parse_int(bad)
+
+    def test_normalize_order_unwraps_nested_place_response(self):
+        # Real place/cancel responses nest the order under data.order (the
+        # guide/data envelope is stripped first); order-list rows stay flat.
+        nested = {"data": {"order": order_row(state="filled", quantity="1.00000",
+                                              processed_quantity="1.00000",
+                                              avg_fill_price="1.00")},
+                  "guide": "guide text"}
+        norm = mcp.MCPClient.normalize_order(nested)
+        self.assertEqual((norm["order_id"], norm["status"], norm["quantity"],
+                          norm["filled_qty"], norm["side"]),
+                         (ORDER_ID, "filled", 1, 1, "buy"))
+        # A null nested order fails closed instead of raising a confusing error.
+        with self.assertRaises(mcp.MCPError):
+            mcp.MCPClient.normalize_order({"data": {"order": None}, "guide": "g"})
+        with self.assertRaises(mcp.MCPError):
+            mcp.MCPClient.normalize_order({"data": {"order": "nope"}, "guide": "g"})
+
+    def test_normalize_order_accepts_flat_broker_row_shapes(self):
+        # Live order-list rows carry decimal-string quantities and a null
+        # top-level side; the side is recovered from the single leg.
+        row = order_row(state="filled", quantity="1.00000",
+                        processed_quantity="1.00000", side=None,
+                        avg_fill_price="0.15", ref_id=None)
+        row.pop("contract_symbol")
+        norm = mcp.MCPClient.normalize_order(row)
+        self.assertEqual((norm["status"], norm["quantity"], norm["filled_qty"],
+                          norm["side"], norm["avg_fill_price"], norm["ref_id"]),
+                         ("filled", 1, 1, "buy", 0.15, None))
+
     def test_fresh_kill_check_after_token_and_before_http_dispatch(self):
         allowed = [True]
         def token():

@@ -109,8 +109,15 @@ def _parse_price(value):
 def _parse_int(value):
     if type(value) is int:
         number = value
-    elif type(value) is str and re.fullmatch(r"\d+", value.strip()):
-        number = int(value.strip())
+    elif type(value) is str:
+        text = value.strip()
+        if re.fullmatch(r"\d+", text):
+            number = int(text)
+        elif re.fullmatch(r"\d+\.0+", text):
+            # The broker renders integral quantities as decimal strings ("1.00000").
+            number = int(text.split(".")[0])
+        else:
+            raise MCPError("Invalid integer string")
     else:
         raise MCPError("Invalid integer string")
     return number
@@ -791,11 +798,19 @@ class MCPClient:
         """Single normalization entry point for place/cancel/order snapshots.
 
         Normalized shape: {"order_id", "ref_id", "option_id", "contract_symbol",
-        "side", "quantity", "status", "filled_qty", "avg_fill_price"}. The broker
-        row shapes for fills are unverified against a real trade, so anything
+        "side", "quantity", "status", "filled_qty", "avg_fill_price"}.
+        Place/cancel responses nest the order under "order" (verified against a
+        real fill on 2026-09-22); order-list rows arrive flat. Anything
         unexpected fails closed here.
         """
         data = _unwrap_envelope(data)
+        if isinstance(data, dict) and "id" not in data and "order_id" not in data:
+            nested = data.get("order")
+            if nested is None:
+                raise MCPError("Broker returned no order; reconciliation required")
+            if not isinstance(nested, dict):
+                raise MCPError("Unsupported order result; broker reconciliation required")
+            data = nested
         if not isinstance(data, dict):
             raise MCPError("Unsupported order result; broker reconciliation required")
         order_id = _uuid(data.get("id", data.get("order_id")), "order_id")
