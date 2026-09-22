@@ -1,20 +1,5 @@
 #!/usr/bin/env bash
-# copy-trader notifier hook.
-# Drains ~/workspace/copy-trader/notifications.jsonl and wakes the worker
-# agent with the queued post-trade notifications (fills, blocks, rejections,
-# exit rung fills, halt warnings). This hook only RELAYS notifications; it
-# needs no arming and places no orders.
+# Standalone deterministic text only: no sourced runtime, agent wake, or tool access.
 set -euo pipefail
-source "$HATCH_HOOK_RUNTIME"
-
-QUEUE="$HOME/workspace/copy-trader/notifications.jsonl"
-
-if [ -s "$QUEUE" ]; then
-  PAYLOAD="$( jq -R -s '{notifications: [split("\n")[] | select(length > 0) | fromjson]}' <"$QUEUE" )"
-  wake "copy-trader notifications" "$PAYLOAD"
-  if [ "${HATCH_HOOK_DRY_RUN:-0}" != "1" ]; then
-    : > "$QUEUE"
-  fi
-else
-  silent "no copy-trader notifications"
-fi
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$SCRIPT_DIR/../notifications.py" "$@"

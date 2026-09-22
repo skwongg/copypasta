@@ -1,593 +1,554 @@
-"""MCP client for Robinhood's Agentic MCP server (streamable HTTP transport).
+"""Fail-closed MCP adapter. No network or credential access in paper mode.
 
-Endpoint: https://agent.robinhood.com/mcp/trading
-Spec: Model Context Protocol, streamable HTTP transport (JSON-RPC 2.0 over HTTP POST).
-
-Transport mechanics (per the MCP streamable-HTTP spec, verified against the
-public spec Sept 2026):
-  * Every call is an HTTP POST of a JSON-RPC 2.0 envelope.
-  * Request headers:
-      Content-Type: application/json
-      Accept: application/json, text/event-stream   (server may answer as
-          plain JSON or as SSE with `event: message` / `data: <json>` frames)
-      Authorization: Bearer <oauth2 token>          (Robinhood uses OAuth 2.0)
-      Mcp-Session-Id: <id>                          (once a session exists)
-      MCP-Protocol-Version: <version>               (negotiated at initialize)
-  * The FIRST request must be `initialize` with protocolVersion, capabilities,
-    and clientInfo. The server replies with its session id in the
-    `Mcp-Session-Id` response header; all later requests echo it back.
-    After `initialize` the client sends the `notifications/initialized`
-    notification (a JSON-RPC notification: no `id`, no response expected).
-  * Sessions can be torn down with an HTTP DELETE + `Mcp-Session-Id` header.
-  * A 401 means the bearer token is invalid/expired -> AuthError.
-
-Auth: the OAuth 2.0 bearer token comes from the sibling module
-`oauth_client.get_valid_token()`. Import it lazily so this module works even
-if oauth_client.py is not built yet; alternatively pass any zero-arg
-`token_provider` callable (or a plain token string).
-
-SAFETY: this module never constructs a live client on its own. `mode`
-defaults to "dry_run"; order-mutating wrappers (place/cancel) refuse to call
-the tool unless mode == "live", and "live" may only be chosen explicitly by
-the orchestrator/operator at runtime. Nothing in this build may construct
-`MCPClient(mode="live")`.
-
-NOTE ON TOOL NAMES: Robinhood's real trading-tool names are UNVERIFIED (the
-endpoint was not live-reachable during this build and options order support
-is per-account). Capability binding is therefore heuristic: `_bind()` maps
-stable capability keys to actual tool names found via tools/list, using
-case-insensitive substring heuristics. If a capability cannot be mapped, the
-typed wrappers raise CapabilityMissing. The exact live question to verify is
-at the bottom of this docstring.
-
-LIVE VERIFICATION QUESTION (still to answer against the real endpoint):
-  "Call tools/list on https://agent.robinhood.com/mcp/trading with a valid
-   OAuth token and report: (1) the full list of tool names, (2) which of them
-   create options orders, (3) whether any tool supports stop/limit conditional
-   options orders, (4) the exact parameter schema of the options order tool
-   (field names for contract symbol, side, qty, order type, limit price), and
-   (5) whether equity order tools exist alongside options tools."
-
-Stdlib only (urllib). No network calls are made at import time.
+The exact tool names are allowlisted, but this adapter's argument/result contract
+has NOT been verified against a real account. LIVE_TRADING_ENABLED deliberately
+blocks broker mutations until that separate review is completed. The normalized
+shapes below are an offline contract, not a claim about Robinhood's live schema.
 """
+from __future__ import annotations
 
 import itertools
 import json
-import os
+import math
 import ssl
 import urllib.error
 import urllib.request
 
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
+ENDPOINT = "https://agent.robinhood.com/mcp/trading"
+MCP_PROTOCOL_VERSION = "2025-03-26"
+LIVE_TRADING_ENABLED = False  # Source-only gate; deliberately no environment bypass.
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+TOOL_NAMES = {
+    "find_contracts": "get_option_instruments",
+    "option_quote": "get_option_quotes",
+    "review_option_order": "review_option_order",
+    "place_option_order": "place_option_order",
+    "cancel_order": "cancel_option_order",
+    "positions": "get_option_positions",
+    "orders": "get_option_orders",
+}
+MUTATING_TOOLS = frozenset({"place_option_order", "cancel_option_order"})
+ALLOWED_TOOLS = frozenset(TOOL_NAMES.values())
 
 
 class MCPError(Exception):
-    """Base error for MCP transport / protocol failures."""
+    """Redacted transport or contract failure."""
 
 
 class AuthError(MCPError):
-    """401 from the server: bearer token invalid or expired -> re-run OAuth."""
+    pass
 
 
 class CapabilityMissing(MCPError):
-    """A capability could not be bound to any real tool name from tools/list."""
-
-    def __init__(self, capability, tools_seen):
+    def __init__(self, capability, tools_seen=()):
         self.capability = capability
         self.tools_seen = list(tools_seen)
-        super().__init__(
-            "Capability %r not found: no tool name matched the heuristics. "
-            "Tools seen on the server: %s. Verify tool names live via "
-            "tools/list (see module docstring)."
-            % (capability, ", ".join(self.tools_seen) or "(none)")
-        )
+        super().__init__("Required exact MCP capability unavailable")
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise MCPError("MCP redirect refused")
 
-MCP_PROTOCOL_VERSION = "2025-03-26"  # negotiated at initialize; updated on server echo
+
+def _number(value):
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _json_loads(value):
+    def pairs(items):
+        result = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+    def reject_constant(_):
+        raise ValueError("non-finite JSON number")
+    return json.loads(value, object_pairs_hook=pairs, parse_constant=reject_constant)
+
+
+def _validate_schema(schema, value):
+    """Small, explicit JSON Schema subset; unsupported schemas fail closed."""
+    allowed = {"type", "properties", "required", "additionalProperties", "items",
+               "enum", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+               "minLength", "maxLength", "minItems", "maxItems", "description", "title"}
+    if not isinstance(schema, dict) or set(schema) - allowed:
+        raise MCPError("Unsupported MCP input schema")
+    kind = schema.get("type")
+    predicates = {"object": lambda x: type(x) is dict,
+                  "array": lambda x: type(x) is list,
+                  "string": lambda x: type(x) is str,
+                  "integer": lambda x: type(x) is int,
+                  "number": _number,
+                  "boolean": lambda x: type(x) is bool,
+                  "null": lambda x: x is None}
+    if type(kind) is not str or kind not in predicates or not predicates[kind](value):
+        raise MCPError("MCP argument type does not match supported schema")
+    if "enum" in schema and value not in schema["enum"]:
+        raise MCPError("MCP argument outside allowed enumeration")
+    if kind == "object":
+        props = schema.get("properties")
+        required = schema.get("required", [])
+        if (not isinstance(props, dict) or not isinstance(required, list)
+                or any(type(k) is not str or k not in props for k in required)
+                or schema.get("additionalProperties", False) is not False):
+            raise MCPError("Unsupported MCP object schema")
+        if set(value) - set(props) or set(required) - set(value):
+            raise MCPError("MCP arguments do not match required properties")
+        # Even optional schema branches must use the supported subset.
+        for prop in props.values():
+            _check_schema_definition(prop)
+        for key, item in value.items():
+            _validate_schema(props[key], item)
+    elif kind == "array":
+        if "items" not in schema:
+            raise MCPError("MCP array schema requires items")
+        _check_schema_definition(schema["items"])
+        for item in value:
+            _validate_schema(schema["items"], item)
+    for field, op in (("minimum", lambda a, b: a >= b),
+                      ("maximum", lambda a, b: a <= b),
+                      ("exclusiveMinimum", lambda a, b: a > b),
+                      ("exclusiveMaximum", lambda a, b: a < b)):
+        if field in schema:
+            if not _number(value) or not _number(schema[field]) or not op(value, schema[field]):
+                raise MCPError("MCP numeric argument violates schema")
+    for low, high, expected in (("minLength", "maxLength", "string"),
+                                ("minItems", "maxItems", "array")):
+        for field in (low, high):
+            if field in schema:
+                bound = schema[field]
+                if (kind != expected or type(bound) is not int or bound < 0
+                        or (field == low and len(value) < bound)
+                        or (field == high and len(value) > bound)):
+                    raise MCPError("MCP argument length violates schema")
+
+
+def _check_schema_definition(schema):
+    """Validate schema syntax without inventing values for optional properties."""
+    if not isinstance(schema, dict):
+        raise MCPError("Unsupported MCP schema")
+    allowed = {"type", "properties", "required", "additionalProperties", "items",
+               "enum", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+               "minLength", "maxLength", "minItems", "maxItems", "description", "title"}
+    kind = schema.get("type")
+    if set(schema) - allowed or type(kind) is not str or kind not in {"object", "array", "string", "integer", "number", "boolean", "null"}:
+        raise MCPError("Unsupported MCP input schema")
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
+        raise MCPError("Unsupported MCP enumeration")
+    if kind == "object":
+        props = schema.get("properties")
+        req = schema.get("required", [])
+        if (type(props) is not dict or type(req) is not list
+                or any(type(k) is not str or k not in props for k in req)
+                or schema.get("additionalProperties", False) is not False):
+            raise MCPError("Unsupported MCP object schema")
+        for child in props.values():
+            _check_schema_definition(child)
+    elif "properties" in schema or "required" in schema or "additionalProperties" in schema:
+        raise MCPError("Unsupported MCP schema constraint")
+    if kind == "array":
+        _check_schema_definition(schema.get("items"))
+    elif "items" in schema:
+        raise MCPError("Unsupported MCP schema constraint")
+    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+        if key in schema and (kind not in {"integer", "number"} or not _number(schema[key])):
+            raise MCPError("Unsupported MCP numeric schema")
+    for key, expected in (("minLength", "string"), ("maxLength", "string"),
+                           ("minItems", "array"), ("maxItems", "array")):
+        if key in schema and (kind != expected or type(schema[key]) is not int or schema[key] < 0):
+            raise MCPError("Unsupported MCP length schema")
+
+
+def _tool_result(result):
+    if not isinstance(result, dict) or result.get("isError", False) is not False:
+        raise MCPError("MCP tool failed or returned an invalid envelope")
+    if "structuredContent" in result:
+        data = result["structuredContent"]
+    else:
+        content = result.get("content")
+        if (not isinstance(content, list) or len(content) != 1
+                or not isinstance(content[0], dict) or content[0].get("type") != "text"
+                or not isinstance(content[0].get("text"), str)):
+            raise MCPError("MCP tool result requires one JSON text item or structured content")
+        try:
+            data = _json_loads(content[0]["text"])
+        except (ValueError, TypeError):
+            raise MCPError("MCP tool returned invalid JSON") from None
+    if not isinstance(data, (dict, list)):
+        raise MCPError("MCP tool result must be a JSON object or list")
+    return data
 
 
 class MCPClient:
-    """Streamable-HTTP MCP client for Robinhood's trading MCP endpoint.
-
-    Args:
-        token_provider: zero-arg callable returning a bearer token string, OR
-            a plain token string, OR None. When None, `_token()` lazily
-            imports `get_valid_token` from the sibling `oauth_client` module.
-        endpoint: MCP streamable-HTTP URL (default the trading endpoint).
-        mode: "dry_run" (default) or "live". Order-mutating tools are gated on
-            mode == "live". NOTHING IN THIS BUILD MAY CONSTRUCT A LIVE CLIENT.
-    """
-
-    def __init__(self, token_provider=None, endpoint="https://agent.robinhood.com/mcp/trading",
-                 mode="dry_run"):
-        self.endpoint = endpoint
-        self.mode = mode
-        self.token_provider = token_provider
+    def __init__(self, token_provider=None, endpoint=ENDPOINT, mode="dry_run",
+                 account_number=None, state_context=None, mutation_guard=None, transport=None):
+        if endpoint != ENDPOINT:
+            raise MCPError("Unapproved MCP endpoint")
+        if mode not in {"dry_run", "live"}:
+            raise MCPError("Invalid MCP mode")
+        if mode == "live" and (type(account_number) is not str or not account_number.strip()):
+            raise MCPError("Live MCP requires an explicit account number")
+        self.endpoint, self.mode = endpoint, mode
+        self.account_number, self.state_context = account_number, state_context
+        self.token_provider, self.transport = token_provider, transport
+        self.mutation_guard = mutation_guard
         self.session_id = None
         self.protocol_version = MCP_PROTOCOL_VERSION
+        self._initialized = False
         self._id_counter = itertools.count(1)
-        self._tools_cache = None  # raw tools/list result
-        self._bindings = None     # capability -> real tool name
-
-        # urllib honors https_proxy/http_proxy env vars through its default
-        # ProxyHandler, which matters inside the sandbox egress proxy. TLS
-        # verification stays on (default SSL context).
+        self._tools_cache = None
+        self._bindings = None
         self._opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        )
+            _NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
-    # -- auth -------------------------------------------------------------
     def _token(self):
+        if self.mode != "live":
+            raise MCPError("Paper mode is offline; supply an explicit test transport")
         if self.token_provider is None:
-            from oauth_client import get_valid_token  # sibling module; built separately
-            return get_valid_token()
-        if callable(self.token_provider):
-            return self.token_provider()
-        return self.token_provider
+            from oauth_client import get_valid_token
+            token = get_valid_token()
+        else:
+            token = self.token_provider() if callable(self.token_provider) else self.token_provider
+        if type(token) is not str or not token or any(c in token for c in "\r\n"):
+            raise AuthError("No valid MCP bearer token available")
+        return token
 
-    # -- low-level transport ----------------------------------------------
     def _request_headers(self, include_session=True):
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "MCP-Protocol-Version": self.protocol_version,
-            "User-Agent": "copy-trader-mcp-client/0.1",
-        }
-        token = self._token()
-        if token:
-            headers["Authorization"] = "Bearer %s" % token
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                   "MCP-Protocol-Version": self.protocol_version, "Authorization": "Bearer " + self._token()}
         if include_session and self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         return headers
 
-    def _parse_response_body(self, body: bytes, content_type: str, request_id):
-        """Accept either plain JSON or an SSE stream; return the matching payload."""
-        text = body.decode("utf-8", errors="replace")
-        if "text/event-stream" in (content_type or ""):
-            payloads = []
-            for line in text.splitlines():
-                line = line.strip()
-                if line.startswith("data:"):
-                    chunk = line[len("data:"):].strip()
-                    if chunk and chunk != "[DONE]":
-                        try:
-                            payloads.append(json.loads(chunk))
-                        except json.JSONDecodeError:
-                            continue
-            if not payloads:
-                raise MCPError("SSE response contained no data frames")
-            # Prefer the frame carrying our request id.
-            for p in payloads:
-                if isinstance(p, dict) and p.get("id") == request_id:
-                    return p
-            return payloads[-1]
-        return json.loads(text)
+    def _mutation_allowed(self):
+        if self.mode != "live":
+            raise MCPError("Broker mutations forbidden in paper mode")
+        if not LIVE_TRADING_ENABLED:
+            raise MCPError("Live trading disabled: broker adapter and account schema unverified")
+        if type(self.account_number) is not str or not self.account_number.strip():
+            raise MCPError("Broker mutations require an explicit account number")
+        if self.state_context is not None and (
+                self.state_context.mode != "live" or self.state_context.account != self.account_number):
+            raise MCPError("Client mode/account does not match its trading state")
+        try:
+            if self.mutation_guard is not None:
+                allowed = self.mutation_guard()
+            else:
+                import kill
+                allowed = (kill.can_fire(context=self.state_context) if self.state_context is not None
+                           else kill.can_fire(mode=self.mode, account=self.account_number))
+        except Exception:
+            raise MCPError("Broker mutation safety gate failed") from None
+        if allowed is not True:
+            raise MCPError("Broker mutation blocked by arm/kill gate")
+
+    def assert_mutation_allowed(self):
+        """Preflight without discovering tools or accessing credentials/network."""
+        self._mutation_allowed()
+
+    def _validate_dispatch(self, payload):
+        if type(payload) is not dict or payload.get("jsonrpc") != "2.0":
+            raise MCPError("Invalid outgoing JSON-RPC envelope")
+        method = payload.get("method")
+        if method not in {"initialize", "notifications/initialized", "tools/list", "tools/call"}:
+            raise MCPError("Unapproved MCP method")
+        if method == "tools/call":
+            params = payload.get("params")
+            if type(params) is not dict or set(params) != {"name", "arguments"}:
+                raise MCPError("Invalid outgoing tool call")
+            name = params["name"]
+            if name not in ALLOWED_TOOLS:
+                raise CapabilityMissing("unapproved tool")
+            if name in MUTATING_TOOLS:
+                self._mutation_allowed()
+            definitions = {t["name"]: t for t in self._tools_cache or []}
+            if name not in definitions:
+                raise MCPError("Tool schema must be discovered before dispatch")
+            schema = definitions[name].get("inputSchema")
+            _check_schema_definition(schema)
+            _validate_schema(schema, params["arguments"])
+            if name in MUTATING_TOOLS:
+                self._validate_mutation_arguments(name, params["arguments"])
+
+    def _validate_mutation_arguments(self, name, args):
+        """Raw dispatch must satisfy the same contract as typed order wrappers."""
+        if type(args) is not dict or args.get("account_number") != self.account_number:
+            raise MCPError("Order account does not match the explicit client account")
+        if name == "place_option_order":
+            required = {"account_number", "contract_symbol", "side", "quantity", "order_type",
+                        "limit_price", "client_order_id"}
+            if set(args) != required:
+                raise MCPError("Unsupported option order arguments")
+            self._order_args(args["contract_symbol"], args["side"], args["quantity"],
+                             args["order_type"], args["limit_price"])
+            if type(args["client_order_id"]) is not str or not args["client_order_id"]:
+                raise MCPError("An explicit idempotency identifier is required")
+        elif (set(args) != {"account_number", "order_id"}
+              or type(args["order_id"]) is not str or not args["order_id"]):
+            raise MCPError("Invalid cancel order arguments")
+
+    @staticmethod
+    def _check_response(response, request_id):
+        if (type(response) is not dict or response.get("jsonrpc") != "2.0"
+                or type(response.get("id")) is not type(request_id) or response.get("id") != request_id):
+            raise MCPError("JSON-RPC response ID or envelope mismatch")
+        if "error" in response:
+            raise MCPError("MCP returned a JSON-RPC error")
+        if "result" not in response:
+            raise MCPError("MCP response has no result")
+        return response
+
+    def _parse_response_body(self, body, content_type, request_id):
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise MCPError("MCP response exceeds size limit")
+        try:
+            text = body.decode("utf-8")
+            if "text/event-stream" in (content_type or ""):
+                matches = []
+                for block in text.replace("\r\n", "\n").split("\n\n"):
+                    lines = [line[5:].lstrip() for line in block.splitlines() if line.startswith("data:")]
+                    if not lines:
+                        continue
+                    frame = _json_loads("\n".join(lines))
+                    if isinstance(frame, dict) and frame.get("id") == request_id:
+                        matches.append(frame)
+                if len(matches) != 1:
+                    raise MCPError("SSE response has no unique matching response ID")
+                response = matches[0]
+            else:
+                response = _json_loads(text)
+        except (ValueError, UnicodeError):
+            raise MCPError("Invalid MCP JSON response") from None
+        return self._check_response(response, request_id)
 
     def _post(self, payload, include_session=True):
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(self.endpoint, data=data, method="POST")
-        for k, v in self._request_headers(include_session=include_session).items():
-            req.add_header(k, v)
+        # This gate also covers direct _rpc/_post calls and optional helpers.
+        self._validate_dispatch(payload)
+        notification = "id" not in payload
+        if self.transport is not None:
+            self._validate_dispatch(payload)
+            response = self.transport(payload)
+            return None if notification else self._check_response(response, payload["id"])
+        if self.mode != "live":
+            raise MCPError("Paper mode is offline; supply an explicit test transport")
+        req = urllib.request.Request(self.endpoint, data=json.dumps(payload, allow_nan=False).encode(),
+                                     headers=self._request_headers(include_session), method="POST")
+        # Fresh arm/kill check AFTER token retrieval and immediately before send.
+        self._validate_dispatch(payload)
         try:
-            with self._opener.open(req, timeout=60) as resp:
-                new_session = resp.headers.get("Mcp-Session-Id")
-                if new_session:
-                    self.session_id = new_session
-                echoed_version = resp.headers.get("MCP-Protocol-Version")
-                if echoed_version:
-                    self.protocol_version = echoed_version
-                return self._parse_response_body(
-                    resp.read(), resp.headers.get("Content-Type", ""), payload.get("id")
-                )
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise AuthError(
-                    "401 Unauthorized from Robinhood MCP: bearer token invalid "
-                    "or expired. Re-run the OAuth flow (oauth_client) and retry."
-                )
-            detail = e.read().decode("utf-8", errors="replace")[:500]
-            raise MCPError("HTTP %d from MCP server: %s" % (e.code, detail))
-
-    def _rpc(self, method, params=None):
-        """Low-level JSON-RPC 2.0 call over streamable HTTP with session handling."""
-        self._ensure_session()
-        request_id = next(self._id_counter)
-        envelope = {"jsonrpc": "2.0", "id": request_id, "method": method}
-        if params is not None:
-            envelope["params"] = params
-        response = self._post(envelope)
-        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
-            raise MCPError("Malformed JSON-RPC response: %r" % (response,))
-        if "error" in response:
-            err = response["error"]
-            raise MCPError("JSON-RPC error %s: %s"
-                           % (err.get("code"), err.get("message")))
-        return response.get("result")
+            with self._opener.open(req, timeout=30) as resp:
+                if resp.geturl() != ENDPOINT or not 200 <= resp.status < 300:
+                    raise MCPError("MCP redirect or unsuccessful response refused")
+                body = resp.read(MAX_RESPONSE_BYTES + 1)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise MCPError("MCP response exceeds size limit")
+                result = None if notification else self._parse_response_body(
+                    body, resp.headers.get("Content-Type", ""), payload["id"])
+                session = resp.headers.get("Mcp-Session-Id")
+                if session:
+                    if len(session) > 256 or not session.isascii() or any(ord(c) < 33 or ord(c) > 126 for c in session):
+                        raise MCPError("Invalid MCP session header")
+                    self.session_id = session
+                return result
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == 401:
+                raise AuthError("MCP authorization failed") from None
+            raise MCPError("MCP HTTP request failed") from None
+        except (urllib.error.URLError, OSError, ValueError):
+            raise MCPError("MCP transport failed") from None
 
     def _ensure_session(self):
-        """Run the initialize + notifications/initialized handshake once."""
-        if self.session_id is not None:
+        if self._initialized:
             return
-        request_id = next(self._id_counter)
-        init = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": self.protocol_version,
-                "capabilities": {},
-                "clientInfo": {"name": "copy-trader", "version": "0.1"},
-            },
-        }
-        # initialize goes out WITHOUT a session id (server creates one).
-        response = self._post(init, include_session=False)
-        if not isinstance(response, dict) or "error" in response:
-            raise MCPError("initialize failed: %r" % (response,))
-        server_version = (response.get("result") or {}).get("protocolVersion")
-        if server_version:
-            self.protocol_version = server_version
-        if not self.session_id:
-            raise MCPError("initialize succeeded but server returned no Mcp-Session-Id")
-        # Complete the handshake with the initialized notification (no id,
-        # no response expected).
-        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-        data = json.dumps(notify).encode("utf-8")
-        req = urllib.request.Request(self.endpoint, data=data, method="POST")
-        for k, v in self._request_headers().items():
-            req.add_header(k, v)
-        try:
-            with self._opener.open(req, timeout=60) as resp:
-                resp.read()
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise AuthError("401 on notifications/initialized: re-run OAuth.")
-            # Notifications may legitimately return 202/empty; only hard-fail
-            # on auth. Other statuses are tolerated here.
-            pass
+        rid = next(self._id_counter)
+        response = self._post({"jsonrpc": "2.0", "id": rid, "method": "initialize", "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+            "clientInfo": {"name": "copypasta", "version": "0.2"}}}, include_session=False)
+        result = response["result"]
+        if not isinstance(result, dict) or result.get("protocolVersion") != MCP_PROTOCOL_VERSION:
+            raise MCPError("Unsupported MCP protocol version")
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self._initialized = True
+
+    def _rpc(self, method, params=None):
+        if method == "tools/call":
+            name = params.get("name") if type(params) is dict else None
+            if name not in ALLOWED_TOOLS:
+                raise CapabilityMissing("unapproved tool")
+            if name in MUTATING_TOOLS:
+                self._mutation_allowed()
+        elif method != "tools/list":
+            raise MCPError("Unapproved RPC method")
+        self._ensure_session()
+        payload = {"jsonrpc": "2.0", "id": next(self._id_counter), "method": method, "params": params or {}}
+        return self._post(payload)["result"]
 
     def close(self):
-        """Best-effort session teardown (HTTP DELETE + Mcp-Session-Id)."""
-        if not self.session_id:
-            return
-        req = urllib.request.Request(self.endpoint, method="DELETE")
-        for k, v in self._request_headers().items():
-            req.add_header(k, v)
-        try:
-            with self._opener.open(req, timeout=15) as resp:
-                resp.read()
-        except Exception:
-            pass
-        finally:
-            self.session_id = None
+        # Local teardown only; no hidden credential refresh or network operation.
+        self.session_id = None
+        self._initialized = False
 
-    # -- tools/list + capability binding ----------------------------------
     def list_tools(self):
-        """Return the raw list of tool dicts from tools/list (cached)."""
         if self._tools_cache is None:
-            result = self._rpc("tools/list", {}) or {}
-            self._tools_cache = result.get("tools", [])
+            result = self._rpc("tools/list", {})
+            if not isinstance(result, dict) or type(result.get("tools")) is not list or result.get("nextCursor"):
+                raise MCPError("Unsupported MCP tools listing")
+            items = result["tools"]
+            if any(type(t) is not dict or type(t.get("name")) is not str for t in items):
+                raise MCPError("Invalid MCP tools listing")
+            if len({t["name"] for t in items}) != len(items):
+                raise MCPError("Duplicate MCP tool name")
+            self._tools_cache = items
         return self._tools_cache
 
     def refresh_tools(self):
-        """Clear the tools/list cache (e.g. after a server-side tool rollout)."""
-        self._tools_cache = None
-        self._bindings = None
-
-    # capability -> required substrings (all must appear, case-insensitive)
-    _HEURISTICS = {
-        "quote": (("quote",), ("quote", "price")),
-        "find_contracts": (("contract",), ("option", "chain"), ("expir",)),
-        "option_quote": (("option", "quote"), ("quote", "contract")),
-        "review_option_order": (("review", "option", "order"), ("preview", "option", "order"),
-                                ("simulate", "option", "order")),
-        "place_option_order": (("place", "option", "order"), ("create", "option", "order"),
-                               ("submit", "option", "order")),
-        "cancel_order": (("cancel", "order"),),
-        "positions": (("position",),),
-        "orders": (("order", "history"), ("list", "order"), ("get", "order")),
-        "conditional_place": (("conditional", "order"), ("stop", "order"), ("oco",)),
-        "equity_quote": (("equity", "quote"), ("stock", "quote")),
-        "place_equity_order": (("place", "equity", "order"), ("place", "stock", "order"),
-                               ("create", "equity", "order")),
-    }
+        self._tools_cache = self._bindings = None
 
     def _bind(self):
-        """Map capability keys to real tool names using substring heuristics.
-
-        The heuristics deliberately do NOT invent tool names: a capability is
-        bound only if some tool from tools/list matches. Ambiguity rule: the
-        first match in server order wins; the full tools list is available via
-        list_tools() for inspection.
-        """
-        if self._bindings is not None:
-            return self._bindings
-        tools = self.list_tools()
-        names = [(t.get("name") or "") for t in tools]
-        lowered = [n.lower() for n in names]
-        bindings = {}
-        for capability, alternatives in self._HEURISTICS.items():
-            bindings[capability] = None
-            for alt in alternatives:
-                for i, lname in enumerate(lowered):
-                    if all(sub in lname for sub in alt):
-                        bindings[capability] = names[i]
-                        break
-                if bindings[capability]:
-                    break
-        self._bindings = bindings
-        return bindings
+        names = {t["name"] for t in self.list_tools()}
+        return {cap: name if name in names else None for cap, name in TOOL_NAMES.items()}
 
     def _tool_for(self, capability):
         name = self._bind().get(capability)
-        if not name:
-            raise CapabilityMissing(capability,
-                                    [t.get("name") for t in self.list_tools()])
+        if name is None:
+            raise CapabilityMissing(capability)
         return name
 
     def check_options_support(self):
-        """Answer THE capability question from live tools/list data.
-
-        Returns {"options_orders": bool, "conditional_orders": bool,
-                 "equities_orders": bool, "tools_found": [...], "missing": [...]}.
-        """
         bindings = self._bind()
-        tools_found = sorted({n for n in bindings.values() if n})
-        key_caps = ["quote", "find_contracts", "option_quote", "review_option_order",
-                    "place_option_order", "cancel_order", "positions", "orders",
-                    "conditional_place"]
-        missing = [c for c in key_caps if not bindings.get(c)]
-        return {
-            "options_orders": bool(bindings.get("place_option_order")),
-            "conditional_orders": bool(bindings.get("conditional_place")),
-            "equities_orders": bool(bindings.get("place_equity_order")),
-            "tools_found": tools_found,
-            "missing": missing,
-        }
+        return {"options_orders": bool(bindings["place_option_order"]), "conditional_orders": False,
+                "equities_orders": False, "live_trading_enabled": LIVE_TRADING_ENABLED,
+                "tools_found": sorted(n for n in bindings.values() if n),
+                "missing": [k for k, v in bindings.items() if v is None]}
 
     def call_tool(self, name, arguments):
-        """Call a tool by its REAL server name; return the result dict."""
-        result = self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
-        return result if isinstance(result, dict) else {"result": result}
+        if name not in ALLOWED_TOOLS:
+            raise CapabilityMissing("unapproved tool")
+        if name in MUTATING_TOOLS:
+            self._mutation_allowed()
+        self.list_tools()
+        return _tool_result(self._rpc("tools/call", {"name": name, "arguments": arguments}))
 
-    # -- typed wrappers ----------------------------------------------------
-    def get_quote(self, symbol):
-        """Underlying/equity quote -> {"bid","ask","last",...}."""
-        tool = self._tool_for("quote")
-        return self.call_tool(tool, {"symbol": symbol})
+    def _account_args(self):
+        return {"account_number": self.account_number} if self.account_number is not None else {}
 
-    def find_option_contracts(self, underlying, expiry, strike: float, option_type):
-        """Find option contracts -> list of {"contract_symbol","expiry","strike","option_type"}.
-
-        expiry: "YYYY-MM-DD"; option_type: "call" | "put".
-        """
-        tool = self._tool_for("find_contracts")
-        return self.call_tool(tool, {
-            "underlying": underlying,
-            "expiry": expiry,
-            "strike": strike,
-            "option_type": option_type,
-        })
+    def find_option_contracts(self, underlying, expiry, strike, option_type):
+        data = self.call_tool(self._tool_for("find_contracts"), {
+            "underlying": underlying, "expiry": expiry, "strike": strike, "option_type": option_type})
+        if type(data) is not list or any(
+                type(x) is not dict or type(x.get("contract_symbol")) is not str or not x["contract_symbol"]
+                or type(x.get("underlying")) is not str or type(x.get("expiry")) is not str
+                or not _number(x.get("strike")) or x["strike"] <= 0 or x.get("option_type") not in {"call", "put"}
+                for x in data):
+            raise MCPError("Unsupported option instruments result")
+        return data
 
     def get_option_quote(self, contract_symbol):
-        """Option quote -> {"bid","ask","last",...}."""
-        tool = self._tool_for("option_quote")
-        return self.call_tool(tool, {"contract_symbol": contract_symbol})
+        data = self.call_tool(self._tool_for("option_quote"), {"contract_symbol": contract_symbol})
+        if type(data) is list and len(data) == 1:
+            data = data[0]
+        if (type(data) is not dict or data.get("contract_symbol") != contract_symbol
+                or not _number(data.get("ask")) or data["ask"] <= 0
+                or not _number(data.get("bid")) or data["bid"] < 0 or data["bid"] > data["ask"]):
+            raise MCPError("Unsupported or invalid option quote result")
+        return data
 
-    def review_option_order(self, contract_symbol, side, qty, order_type, limit_price=None):
-        """Simulate/review an option order -> simulation dict (no side effects)."""
-        tool = self._tool_for("review_option_order")
-        args = {"contract_symbol": contract_symbol, "side": side,
-                "quantity": qty, "order_type": order_type}
-        if limit_price is not None:
-            args["limit_price"] = limit_price
-        return self.call_tool(tool, args)
+    def _order_args(self, contract_symbol, side, qty, order_type, limit_price):
+        if (type(contract_symbol) is not str or not contract_symbol or type(side) is not str or side not in {"buy", "sell"}
+                or type(qty) is not int or qty <= 0 or order_type != "limit"
+                or not _number(limit_price) or limit_price <= 0):
+            raise MCPError("Unsupported option order arguments")
+        return dict(self._account_args(), contract_symbol=contract_symbol, side=side,
+                    quantity=qty, order_type=order_type, limit_price=limit_price)
 
-    def place_option_order(self, contract_symbol, side, qty, order_type, limit_price=None):
-        """Place an option order. DRY-RUN GATED: calls the tool ONLY in live mode."""
-        args = {"contract_symbol": contract_symbol, "side": side,
-                "quantity": qty, "order_type": order_type}
-        if limit_price is not None:
-            args["limit_price"] = limit_price
-        tool = self._tool_for("place_option_order")
-        if self.mode != "live":
-            return {"dry_run": True, "would_call": {"tool": tool, "arguments": args}}
-        return self.call_tool(tool, args)
+    def review_option_order(self, contract_symbol, side, qty, order_type, limit_price=None, *, client_order_id=None):
+        args = self._order_args(contract_symbol, side, qty, order_type, limit_price)
+        if client_order_id is not None:
+            if type(client_order_id) is not str or not client_order_id:
+                raise MCPError("Invalid idempotency identifier")
+            args["client_order_id"] = client_order_id
+        data = self.call_tool(self._tool_for("review_option_order"), args)
+        if type(data) is not dict or type(data.get("approved")) is not bool:
+            raise MCPError("Unsupported review result: explicit boolean approval required")
+        return data
+
+    @staticmethod
+    def normalize_order(data):
+        statuses = {"pending", "partially_filled", "filled", "canceled", "rejected"}
+        required = {"order_id", "client_order_id", "contract_symbol", "side", "quantity",
+                    "status", "filled_qty", "avg_fill_price"}
+        if (type(data) is not dict or not required <= data.keys()
+                or type(data.get("order_id")) is not str or not data["order_id"]
+                or data.get("status") not in statuses or type(data.get("filled_qty")) is not int
+                or data["filled_qty"] < 0):
+            raise MCPError("Unsupported order result; broker reconciliation required")
+        if ("quantity" in data and (type(data["quantity"]) is not int or data["quantity"] <= 0
+                                   or data["filled_qty"] > data["quantity"])):
+            raise MCPError("Invalid order quantity or overfill")
+        for key in ("contract_symbol", "client_order_id"):
+            if key in data and (type(data[key]) is not str or not data[key]):
+                raise MCPError("Invalid order identity")
+        if "side" in data and data["side"] not in {"buy", "sell"}:
+            raise MCPError("Invalid order side")
+        price = data.get("avg_fill_price")
+        if data["filled_qty"] > 0 and (not _number(price) or price <= 0):
+            raise MCPError("Filled order missing a valid fill price")
+        if data["status"] == "filled" and data["filled_qty"] != data["quantity"]:
+            raise MCPError("Filled order does not have its full confirmed quantity")
+        if data["status"] == "partially_filled" and not 0 < data["filled_qty"] < data["quantity"]:
+            raise MCPError("Partial order has an inconsistent filled quantity")
+        if data["status"] == "rejected" and data["filled_qty"]:
+            raise MCPError("Rejected order has unexpected fills")
+        if data["filled_qty"] == 0 and not (price is None or (_number(price) and price == 0)):
+            raise MCPError("Unfilled order has inconsistent fill price")
+        return dict(data)
+
+    def place_option_order(self, contract_symbol, side, qty, order_type, limit_price=None, *, client_order_id=None):
+        self._mutation_allowed()
+        args = self._order_args(contract_symbol, side, qty, order_type, limit_price)
+        if type(client_order_id) is not str or not client_order_id:
+            raise MCPError("An explicit idempotency identifier is required")
+        args["client_order_id"] = client_order_id
+        result = self.normalize_order(self.call_tool(self._tool_for("place_option_order"), args))
+        if ("account_number" in result and result["account_number"] != self.account_number):
+            raise MCPError("Order response account mismatch; reconciliation required")
+        if result["filled_qty"] > qty or any(
+                key in result and result[key] != args[key]
+                for key in ("contract_symbol", "side", "quantity", "client_order_id")):
+            raise MCPError("Order response does not match the submitted intent; reconciliation required")
+        return result
 
     def cancel_order(self, order_id):
-        """Cancel an order. DRY-RUN GATED: calls the tool ONLY in live mode."""
-        tool = self._tool_for("cancel_order")
-        if self.mode != "live":
-            return {"dry_run": True,
-                    "would_call": {"tool": tool, "arguments": {"order_id": order_id}}}
-        return self.call_tool(tool, {"order_id": order_id})
+        self._mutation_allowed()
+        if type(order_id) is not str or not order_id:
+            raise MCPError("Invalid order identifier")
+        return self.normalize_order(self.call_tool(self._tool_for("cancel_order"),
+                                    dict(self._account_args(), order_id=order_id)))
 
     def get_positions(self):
-        """Open positions -> list of {"contract_symbol","qty","avg_price",...}."""
-        tool = self._tool_for("positions")
-        return self.call_tool(tool, {})
+        data = self.call_tool(self._tool_for("positions"), self._account_args())
+        if type(data) is not list or any(
+                type(x) is not dict or type(x.get("contract_symbol")) is not str or not x["contract_symbol"]
+                or type(x.get("quantity")) is not int or x["quantity"] < 0
+                or ("account_number" in x and x["account_number"] != self.account_number)
+                for x in data):
+            raise MCPError("Unsupported positions result")
+        return data
 
     def get_orders(self, status=None):
-        """Orders -> list. Optional status filter (e.g. "open", "filled")."""
-        tool = self._tool_for("orders")
-        args = {}
+        args = self._account_args()
         if status is not None:
             args["status"] = status
-        return self.call_tool(tool, args)
-
-
-# ---------------------------------------------------------------------------
-# Self-test (mocked transport — no network, no real orders)
-# ---------------------------------------------------------------------------
-
-class _FakeTransportClient(MCPClient):
-    """MCPClient with _rpc stubbed: replays scripted JSON-RPC results."""
-
-    def __init__(self, tools, **kwargs):
-        super().__init__(token_provider=lambda: "fake-token", **kwargs)
-        self._fake_tools = tools
-        self.rpc_calls = []  # record of (method, params) the client attempted
-
-    def _ensure_session(self):
-        self.session_id = "fake-session"
-
-    def _rpc(self, method, params=None):
-        self.rpc_calls.append((method, params))
-        if method == "tools/list":
-            return {"tools": self._fake_tools}
-        if method == "tools/call":
-            return {"content": [{"type": "text", "text": "ok"}],
-                    "echo": {"name": params["name"], "arguments": params["arguments"]}}
-        raise AssertionError("unexpected rpc: %r" % method)
-
-
-def _fake_tool(name, description=""):
-    return {"name": name, "description": description, "inputSchema": {"type": "object"}}
-
-
-def run_self_test():
-    passed, failed = [], []
-
-    def check(label, cond, detail=""):
-        (passed if cond else failed).append(label)
-        print(("PASS " if cond else "FAIL ") + label + ((" — " + detail) if detail and not cond else ""))
-
-    # --- Scenario A: plausible tool names ----------------------------------
-    tools_a = [
-        _fake_tool("get_quote", "Get latest quote for a symbol"),
-        _fake_tool("get_option_chain", "List option contracts for an underlying"),
-        _fake_tool("get_option_quote", "Quote for an option contract"),
-        _fake_tool("preview_option_order", "Simulate an option order"),
-        _fake_tool("place_option_order", "Submit an option order"),
-        _fake_tool("cancel_order", "Cancel an open order"),
-        _fake_tool("get_positions", "Open positions"),
-        _fake_tool("list_orders", "Order history"),
-    ]
-    c = _FakeTransportClient(tools_a)  # default mode="dry_run"
-    check("list_tools returns raw tool dicts",
-          isinstance(c.list_tools(), list) and c.list_tools()[0]["name"] == "get_quote")
-    b = c._bind()
-    check("bind place_option_order", b["place_option_order"] == "place_option_order", str(b))
-    check("bind cancel_order", b["cancel_order"] == "cancel_order")
-    check("bind review_option_order", b["review_option_order"] == "preview_option_order")
-    check("bind find_contracts", b["find_contracts"] == "get_option_chain")
-    check("bind conditional_place unmapped", b["conditional_place"] is None)
-    sup = c.check_options_support()
-    check("support: options_orders True", sup["options_orders"] is True, str(sup))
-    check("support: conditional_orders False", sup["conditional_orders"] is False, str(sup))
-    check("support: missing lists conditional_place", "conditional_place" in sup["missing"], str(sup))
-
-    # --- dry_run gate: mutating wrappers must NOT call the tool ------------
-    n_before = len(c.rpc_calls)
-    r = c.place_option_order("SPY260926C00700000", "buy_to_open", 1, "limit", 2.50)
-    check("place dry_run returns dry_run=True", r.get("dry_run") is True, str(r))
-    check("place dry_run names would-be tool+args",
-          r.get("would_call", {}).get("tool") == "place_option_order"
-          and r["would_call"]["arguments"]["contract_symbol"] == "SPY260926C00700000"
-          and r["would_call"]["arguments"]["limit_price"] == 2.50, str(r))
-    check("place dry_run made no tools/call",
-          all(m != "tools/call" for m, _ in c.rpc_calls[n_before:]),
-          str([m for m, _ in c.rpc_calls[n_before:]]))
-    r = c.cancel_order("ord-123")
-    check("cancel dry_run returns dry_run=True", r.get("dry_run") is True, str(r))
-    check("cancel dry_run made no tools/call",
-          all(m != "tools/call" for m, _ in c.rpc_calls), str(c.rpc_calls))
-
-    # --- read-only wrappers DO call through --------------------------------
-    c.get_quote("SPY")
-    c.find_option_contracts("SPY", "2026-09-25", 700.0, "call")
-    c.get_option_quote("SPY260925C00700000")
-    c.review_option_order("SPY260925C00700000", "buy_to_open", 1, "limit", 1.20)
-    c.get_positions()
-    c.get_orders(status="open")
-    called = [p["name"] for m, p in c.rpc_calls if m == "tools/call"]
-    check("read wrappers reached tools/call",
-          called == ["get_quote", "get_option_chain", "get_option_quote",
-                     "preview_option_order", "get_positions", "list_orders"], str(called))
-    rev = [p for m, p in c.rpc_calls if m == "tools/call" and p["name"] == "preview_option_order"][0]
-    check("review passes limit_price", rev["arguments"].get("limit_price") == 1.20, str(rev))
-
-    # --- Scenario B: different naming scheme still binds -------------------
-    tools_b = [
-        _fake_tool("Quote", "quote"),
-        _fake_tool("OptionChainLookup", "chain"),
-        _fake_tool("OptionQuote", "oq"),
-        _fake_tool("ReviewOptionOrder", "rev"),
-        _fake_tool("CreateOptionOrder", "create"),
-        _fake_tool("CancelOrder", "cancel"),
-        _fake_tool("Positions", "pos"),
-        _fake_tool("OrderHistory", "hist"),
-        _fake_tool("ConditionalOrderEntry", "cond"),
-        _fake_tool("PlaceEquityOrder", "eq"),
-    ]
-    c2 = _FakeTransportClient(tools_b)
-    b2 = c2._bind()
-    check("alt bind place_option_order", b2["place_option_order"] == "CreateOptionOrder", str(b2))
-    check("alt bind review_option_order", b2["review_option_order"] == "ReviewOptionOrder")
-    check("alt bind conditional_place", b2["conditional_place"] == "ConditionalOrderEntry")
-    check("alt bind quote (case-insensitive)", b2["quote"] == "Quote")
-    sup2 = c2.check_options_support()
-    check("alt support conditional_orders True", sup2["conditional_orders"] is True, str(sup2))
-    check("alt support equities_orders True", sup2["equities_orders"] is True, str(sup2))
-
-    # --- Scenario C: options ordering tool absent -> CapabilityMissing ------
-    tools_c = [_fake_tool("get_quote"), _fake_tool("get_positions")]
-    c3 = _FakeTransportClient(tools_c)
-    try:
-        c3.place_option_order("X", "buy_to_open", 1, "market")
-        check("CapabilityMissing raised for place_option_order", False)
-    except CapabilityMissing as e:
-        check("CapabilityMissing raised for place_option_order",
-              e.capability == "place_option_order" and "get_quote" in str(e))
-    sup3 = c3.check_options_support()
-    check("no options support detected", sup3["options_orders"] is False
-          and "place_option_order" in sup3["missing"], str(sup3))
-
-    # --- Scenario D: SSE response parsing (no network) ---------------------
-    c4 = _FakeTransportClient(tools_a)
-    sse = (b'event: message\n'
-           b'data: {"jsonrpc":"2.0","id":7,"result":{"tools":[]}}\n\n'
-           b'event: message\n'
-           b'data: {"jsonrpc":"2.0","id":8,"result":{"tools":[{"name":"t"}]}}\n\n')
-    parsed = c4._parse_response_body(sse, "text/event-stream; charset=utf-8", 8)
-    check("SSE parse picks matching id",
-          parsed.get("result", {}).get("tools") == [{"name": "t"}], str(parsed))
-    plain = c4._parse_response_body(b'{"jsonrpc":"2.0","id":9,"result":{"ok":true}}',
-                                    "application/json", 9)
-    check("plain JSON parse", plain.get("result") == {"ok": True}, str(plain))
-
-    # --- Scenario E: 401 -> AuthError --------------------------------------
-    c5 = MCPClient(token_provider=lambda: "bad")
-    def boom(req, timeout=None):
-        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
-    c5._opener.open = boom
-    try:
-        c5._post({"jsonrpc": "2.0", "id": 1, "method": "ping"}, include_session=False)
-        check("401 raises AuthError", False)
-    except AuthError as e:
-        check("401 raises AuthError", "re-run" in str(e).lower() or "OAuth" in str(e))
-    except Exception as e:  # noqa: BLE001
-        check("401 raises AuthError", False, "got %r" % e)
-
-    # --- Scenario F: live mode actually calls (still fake transport) -------
-    c6 = _FakeTransportClient(tools_a, mode="live")
-    r6 = c6.place_option_order("SPY260926C00700000", "buy_to_open", 1, "market")
-    check("live mode reaches tools/call",
-          any(m == "tools/call" and p["name"] == "place_option_order"
-              for m, p in c6.rpc_calls), str(r6))
-    check("live mode result not dry_run", r6.get("dry_run") is not True, str(r6))
-
-    print("\n%d passed, %d failed" % (len(passed), len(failed)))
-    if failed:
-        print("FAILED: " + ", ".join(failed))
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    run_self_test()
+        data = self.call_tool(self._tool_for("orders"), args)
+        if type(data) is not list:
+            raise MCPError("Unsupported orders result")
+        orders = [self.normalize_order(x) for x in data]
+        if any("account_number" in x and x["account_number"] != self.account_number for x in orders):
+            raise MCPError("Orders snapshot account mismatch")
+        return orders

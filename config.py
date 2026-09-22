@@ -1,147 +1,80 @@
-"""Shared configuration for the Robinhood copy-trader.
-
-Pure local logic: no network calls, no credentials, no orders.
-
-Loads global settings + per-trader assumptions from
-~/workspace/trade-watch/trader_config.json and exposes market-calendar
-helpers mirrored from ~/workspace/trade-watch/watch.py.
-"""
-
-from __future__ import annotations
-
+"""Reviewed defaults. No filesystem or network side effects at import."""
+from dataclasses import dataclass, field
+from datetime import datetime
 import json
-from datetime import date, datetime
+import math
+import os
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-_CONFIG_PATH = Path.home() / "workspace" / "trade-watch" / "trader_config.json"
-
-with _CONFIG_PATH.open() as _f:
-    _RAW = json.load(_f)
-
-# ---------------------------------------------------------------------------
-# Global settings (from trader_config.json)
-# ---------------------------------------------------------------------------
-
-MARKET_TZ = ZoneInfo(_RAW["_market_timezone"])
-MAX_ENTRY_SLIPPAGE = float(_RAW["_max_entry_slippage"])  # 0.10
-
-# ---------------------------------------------------------------------------
-# Hard-coded policy constants (2026-09-21 decision with Silas)
-# ---------------------------------------------------------------------------
-
-# Target dollar size for each single copied trade entry.
-TRADE_NOTIONAL_TARGET = 500.0  # per 2026-09-21 policy decision
-# Maximum total dollar exposure across all open positions.
-MAX_OPEN_EXPOSURE = 5000.0  # per 2026-09-21 policy decision
-# Stop copying new trades once realized daily P&L hits this loss (dollars).
-DAILY_LOSS_CAP = 2500.0  # per 2026-09-21 policy decision
-
-# ---------------------------------------------------------------------------
-# Market calendar (NYSE holidays, copied from watch.py's MARKET_HOLIDAYS)
-# ---------------------------------------------------------------------------
-
+MARKET_TZ = ZoneInfo('America/Los_Angeles')
+TRADE_NOTIONAL_TARGET = 500.0
+MAX_OPEN_EXPOSURE = 5000.0
+DAILY_LOSS_CAP = 2500.0
+MAX_ENTRY_SLIPPAGE = 0.10
+MAX_QUOTE_AGE_SECONDS = 30
+TRADERS = {'cassytrades': '0DTE', 'clintoptions': None, 'capricekayem': None}
 MARKET_HOLIDAYS = {
-    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
-    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
-    "2027-01-01", "2027-01-18", "2027-02-15", "2027-04-02", "2027-05-31",
-    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+    '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25', '2026-06-19',
+    '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25', '2027-01-01', '2027-01-18',
+    '2027-02-15', '2027-03-26', '2027-05-31', '2027-06-18', '2027-07-05', '2027-09-06',
+    '2027-11-25', '2027-12-24',
 }
+EARLY_CLOSES = {'2026-11-27', '2026-12-24', '2027-11-26'}
 
 
-def in_market_hours(now: datetime | None = None) -> bool:
-    """True iff now is Mon-Fri, 6:30 AM-1:00 PM PT, and not a market holiday."""
+def default_expiry_for(handle):
+    return TRADERS.get((handle or '').lstrip('@').lower())
+
+
+def in_market_hours(now=None):
     now = now or datetime.now(MARKET_TZ)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=MARKET_TZ)
-    else:
-        now = now.astimezone(MARKET_TZ)
-    if now.strftime("%Y-%m-%d") in MARKET_HOLIDAYS:
         return False
-    if now.weekday() >= 5:  # Sat/Sun
+    now = now.astimezone(MARKET_TZ)
+    if now.year not in {2026, 2027}:
         return False
-    mins = now.hour * 60 + now.minute
-    return 6 * 60 + 30 <= mins < 13 * 60
+    day = now.date().isoformat()
+    if now.weekday() >= 5 or day in MARKET_HOLIDAYS:
+        return False
+    close = 10 * 60 if day in EARLY_CLOSES else 13 * 60
+    return 6 * 60 + 30 <= now.hour * 60 + now.minute < close
 
 
-def trading_day(ts_iso: str) -> date | None:
-    """Validate an ISO-8601 timestamp against the market calendar.
+@dataclass(frozen=True)
+class Policy:
+    sources: dict = field(default_factory=lambda: dict.fromkeys(TRADERS))
+    source_key: bytes | None = None
+    max_age_seconds: int = 300
+    trade_target: float = TRADE_NOTIONAL_TARGET
+    max_exposure: float = MAX_OPEN_EXPOSURE
+    daily_loss_cap: float = DAILY_LOSS_CAP
+    max_slippage: float = MAX_ENTRY_SLIPPAGE
 
-    Parses the timestamp (with offset), converts to MARKET_TZ, and returns
-    the market date if it is a weekday and not a holiday, else None.
-    Used for same-day validation when inferring 0DTE expiries.
-    """
-    ts = datetime.fromisoformat(ts_iso)
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=MARKET_TZ)
-    local = ts.astimezone(MARKET_TZ)
-    d = local.date()
-    if d.weekday() >= 5:
-        return None
-    if d.strftime("%Y-%m-%d") in MARKET_HOLIDAYS:
-        return None
-    return d
-
-
-def default_expiry_for(handle: str) -> str | None:
-    """Default option expiry inference for a trader handle.
-
-    Returns e.g. "0DTE" for CassyTrades (verified 2026-09-21: she never
-    discloses expiry, so an undisclosed expiry means 0DTE), or None when no
-    inference should be made (clintoptions, capricekayem, unknown handles).
-    """
-    key = handle.lstrip("@").lower()
-    for name, entry in _RAW.items():
-        if name.startswith("_") or not isinstance(entry, dict):
-            continue
-        if name.lower() == key:
-            return entry.get("default_expiry")
-    return None
+    def __post_init__(self):
+        if not isinstance(self.sources, dict) or not self.sources or any(
+            key not in TRADERS or (value is not None and (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value)))
+            for key, value in self.sources.items()
+        ):
+            raise ValueError('invalid source allowlist')
+        ids = [v for v in self.sources.values() if v is not None]
+        if len(ids) != len(set(ids)):
+            raise ValueError('source IDs must be unique')
+        if type(self.max_age_seconds) is not int or not 1 <= self.max_age_seconds <= 300:
+            raise ValueError('invalid alert age bound')
+        for value in (self.trade_target, self.max_exposure, self.daily_loss_cap):
+            if type(value) not in (float, int) or not math.isfinite(value) or value <= 0:
+                raise ValueError('invalid risk bound')
+        if type(self.max_slippage) not in (float, int) or not math.isfinite(self.max_slippage) or not 0 <= self.max_slippage <= MAX_ENTRY_SLIPPAGE:
+            raise ValueError('slippage must not exceed reviewed limit')
 
 
-# ---------------------------------------------------------------------------
-# Summary dict for other modules to import
-# ---------------------------------------------------------------------------
-
-POLICY = {
-    "market_timezone": str(MARKET_TZ),
-    "max_entry_slippage": MAX_ENTRY_SLIPPAGE,
-    "trade_notional_target": TRADE_NOTIONAL_TARGET,
-    "max_open_exposure": MAX_OPEN_EXPOSURE,
-    "daily_loss_cap": DAILY_LOSS_CAP,
-    "market_holidays": sorted(MARKET_HOLIDAYS),
-}
-
-
-def _self_test() -> None:
-    pt = MARKET_TZ
-
-    # in_market_hours boundaries
-    assert in_market_hours(datetime(2026, 9, 21, 6, 29, tzinfo=pt)) is False  # before open
-    assert in_market_hours(datetime(2026, 9, 21, 6, 30, tzinfo=pt)) is True   # open edge
-    assert in_market_hours(datetime(2026, 9, 21, 12, 59, tzinfo=pt)) is True  # close edge
-    assert in_market_hours(datetime(2026, 9, 21, 13, 0, tzinfo=pt)) is False  # after close
-    assert in_market_hours(datetime(2026, 9, 19, 10, 0, tzinfo=pt)) is False   # Saturday
-    assert in_market_hours(datetime(2026, 9, 7, 10, 0, tzinfo=pt)) is False   # Labor Day holiday
-
-    # trading_day: rejects Saturday and holiday, accepts a normal weekday
-    assert trading_day("2026-09-19T10:00:00-07:00") is None  # Saturday
-    assert trading_day("2026-09-07T10:00:00-07:00") is None  # Labor Day
-    assert trading_day("2026-09-21T10:00:00-07:00") == date(2026, 9, 21)
-
-    # default_expiry_for
-    assert default_expiry_for("CassyTrades") == "0DTE"
-    assert default_expiry_for("@CassyTrades") == "0DTE"
-    assert default_expiry_for("clintoptions") is None
-    assert default_expiry_for("capricekayem") is None
-    assert default_expiry_for("nobody") is None
-
-    # constants loaded from JSON
-    assert MAX_ENTRY_SLIPPAGE == 0.10
-    assert str(MARKET_TZ) == "America/Los_Angeles"
-
-    print("config.py self-test: OK")
-
-
-if __name__ == "__main__":
-    _self_test()
+def load_policy():
+    path = os.environ.get('COPYTRADER_CONFIG')
+    if not path:
+        return Policy()
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict) or set(data) - {'sources', 'max_age_seconds', 'trade_target', 'max_exposure', 'daily_loss_cap', 'max_slippage'}:
+        raise ValueError('unsupported policy keys')
+    return Policy(**data)

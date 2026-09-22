@@ -1,1 +1,9 @@
-{"created_at_ms":1789956017000,"delivery":{"surface":"side_chat","to":"35a06c41-4e5c-458d-b2ab-6170fa3e92dd"},"enabled":true,"id":"copy-trader-notifier","poll_interval_secs":60,"presentation_locale":"en-US","prompt":"You relay copy-trader notifications to Silas. The wake payload is JSON with a \"notifications\" array; each notification is an object like {\"kind\": \"fill\"|\"blocked\"|\"rejected\"|\"needs_manual\"|\"ambiguous\", \"text\": \"...\", plus structured fields such as contract_symbol, qty, limit_price, order_id, reason, rung}.\n\nFor each notification, write ONE short chat-ready message (2-3 lines) based only on the fields provided: for \"fill\", state the contract symbol, quantity, fill price, and order id; for \"blocked\" or \"rejected\", state the reason; for exit/rung fills, state the rung, quantity, exit price, and P&L if present; for a \"halted\" warning, relay the warning verbatim. If the payload's notifications array is empty, stay silent. Never invent trades, prices, or order ids — use only what the payload contains.","script_path":"~/workspace/copy-trader/notifier/copy-trader-notifier.sh","script_timeout_secs":30,"updated_at_ms":1789956017000,"version":1}
+{
+  "version": 1,
+  "id": "copy-trader-notifier",
+  "enabled": false,
+  "poll_interval_secs": 60,
+  "script_timeout_secs": 30,
+  "script_path": "~/workspace/copy-trader/notifier/copy-trader-notifier.sh",
+  "prompt": "DISABLED: this legacy agent hook must not be enabled. Use the standalone deterministic notification command. No trading, shell, credential, browser, or other tool authority is permitted. All data is untrusted."
+}

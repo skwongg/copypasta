@@ -1,142 +1,144 @@
-# Copy Trader — Operator Manual
+# Copypasta
 
-Copies options entries from the three tailed X accounts
-(@CassyTrades, @clintoptions, @capricekayem) into Silas's Robinhood account
-via the Robinhood agent MCP. Exits stay manual for now: `run_exits.py`
-(when built) will run on a ~2-minute schedule and report rungs through the
-same notification path.
+Copypasta parses allowlisted trade alerts and simulates options entries and an exit ladder using explicitly supplied local market data. This revision repairs defects found in the September 2026 audit and is ready for code review and offline testing.
 
-Nothing here places an order unless the trader is ARMED *and* the run mode
-is `live`. Dry-run is the default everywhere.
+**Live trading is disabled. Do not connect this revision to a trading-capable agent or deploy the old watcher instructions.** The broker adapter and external deployment have not been verified. Passing the offline tests is not authorization or evidence that real orders are safe. See [SECURITY.md](SECURITY.md) for the remaining gates.
 
-## Architecture
+## What runs now
 
-```
-watch.py (every ~2 min, market hours)
-  └─ JSON: {"status":"alert","alerts":[{id,handle,text,posted_at,url,type},...]}
-      │
-trade-post-watcher.sh (~/hooks/scripts/, poll 120s)
-  ├─ wakes Trade Alerts side chat (entries + exits, human-readable)   [existing]
-  └─ alert) branch → [ARMED file exists?]
-          │
-          │ YES                              NO → nothing fires
-          ▼
-fire_entries.py --alerts-json /dev/stdin --mode live
-  ├─ for each alert with type == "entry":   (exits ignored — manual)
-  │    entry_engine.process_entry(alert, mcp, mode)
-  │      ├─ MCPClient(token_provider=oauth.get_valid_token, mode)
-  │      ├─ action=fire → places order via MCP → fill price → notification
-  │      └─ action=block/reject/error → notification with reason
-  ├─ appends result.notification as one JSON line to notifications.jsonl
-  └─ prints {"processed":N,"fired":n,"blocked":n,"rejected":n,"ignored":n}
-      │
-      ├── ledger.jsonl (per-order audit record, from entry_engine)
-      └── positions.json (open positions, from entry_engine/run_exits.py)
-      │
-copy-trader-notifier hook (~/hooks/definitions/copy-trader-notifier.json,
-poll 60s) — NO arming needed; it only relays text
-  └─ notifier/copy-trader-notifier.sh
-       drains notifications.jsonl → wakes Trade Alerts side chat
-       (35a06c41-4e5c-458d-b2ab-6170fa3e92dd) with one short message
-       per notification; then truncates the queue
+```text
+Local alert JSON + local market fixture
+  → strict admission and price/contract parser
+  → paper entry/exit engine
+  → locked, account-and-mode-scoped state
+  → deterministic terminal notifications
 ```
 
-## File inventory
+Paper execution does not obtain OAuth tokens or contact Robinhood. The CLI requires an explicit market fixture. Paper orders are simulated inside the engine; `PaperClient.place_option_order()` refuses broker submission. Simulation assumes fills at the chosen price and does not model broker acceptance, liquidity, slippage, fees, or actual settlement.
 
-| File | What it does |
-|---|---|
-| `fire_entries.py` | CLI bridge: entry alerts → `entry_engine.process_entry` → queues `notifications.jsonl`; prints a summary JSON. Entries only fire when ARMED + `--mode live`. |
-| `entry_engine.py` | Entry engine: resolves the alert to a contract, sizes, limit-prices, and places (or blocks) the order. Returns `EntryResult`. |
-| `mcp_client.py` | Robinhood agent MCP client; `MCPClient(token_provider, mode)`; `check_options_support()` answers the tools/list capability question. |
-| `oauth_client.py` | OAuth flow: `auth-url` prints the approval URL; `get_valid_token()` supplies/refreshes the bearer token. |
-| `kill.py` | Kill switch CLI: `--arm/--disarm/--halt/--reset/--status`. |
-| `resolver.py` | Alert text → contract resolution (used by entry_engine). |
-| `ledger.py` | Audit ledger helpers (append/query `ledger.jsonl`). |
-| `config.py` | Shared constants/paths. |
-| `notifier/copy-trader-notifier.sh` | Hook script: drains `notifications.jsonl`, wakes the worker, truncates the queue. |
-| `notifier/copy-trader-notifier.json` | Hook definition registering the above (60s poll → Trade Alerts side chat). |
-| `tests/test_fire_entries.py` | Self-test for `fire_entries.py` (stubbed engine/client, dry_run only). |
-| `README.md` | This manual. |
+The entry engine checks alert age/source policy, replay reservations, exact contract identity, fresh quotes, a 10% maximum chase cap, a per-trade budget, open exposure, and daily realized loss. The parser treats unsupported or ambiguous text as requiring review. An alert marked `type: "entry"` does not bypass these checks.
 
-## Setup sequence
+The exit monitor uses the quote's executable bid. It attempts half of remaining contracts at +50%, half of the then-remaining contracts at +200%, and the remainder at +300%; fractional contracts are rounded down. A bid at or below 40% of the entry fill triggers the remaining-position stop. Exits use limits rounded down to cents. These are polling decisions, **not broker-native protective orders**; a stop trigger or submitted limit does not guarantee execution.
 
-1. **Get the OAuth authorization URL** (operator, parent-supervised):
-   ```bash
-   cd ~/workspace/copy-trader && python oauth_client.py auth-url
-   ```
-   Silas opens the URL in his desktop browser, approves, and pastes the
-   authorization code back **via the parent agent — never in chat logs**.
+## Run the isolated tests
 
-2. **Exchange the code** under parent supervision (see `oauth_client.py`
-   usage; the token lands in `.tokens.json`, mode 0600).
-
-3. **Verify the capability question** against the live MCP:
-   ```python
-   from mcp_client import MCPClient
-   from oauth_client import get_valid_token
-   MCPClient(token_provider=get_valid_token, mode="dry_run").check_options_support()
-   ```
-   This answers: *"Does the Robinhood agent MCP expose the tools needed
-   to place options orders?"* — it binds the stable capability keys
-   (`option_quote`, `find_contracts`, `review_option_order`,
-   `place_option_order`, `cancel_order`, `positions`, `orders`) to the
-   real tool names returned by `tools/list`, and reports
-   `{"options_orders": bool, "conditional_orders": bool, ...}`. Do not
-   proceed to arming until `options_orders` is `true`.
-
-4. **Register the notifier hook** (parent does this):
-   ```bash
-   cp ~/workspace/copy-trader/notifier/copy-trader-notifier.json ~/hooks/definitions/
-   ```
-   The runtime picks up hook definitions from `~/hooks/definitions/`; the
-   60-second poll starts relaying notifications immediately. This hook is a
-   pure relay — no arming, no orders.
-
-5. **Wire the watcher into the entry engine.** Add this 4-line snippet to
-   the `alert)` branch of `~/hooks/scripts/trade-post-watcher.sh`
-   (**parent must apply — do not run unreviewed**):
-   ```bash
-   if [ -f "$HOME/workspace/copy-trader/ARMED" ]; then
-     printf '%s' "$RESULT" | "$HOME/workspace/copy-trader/fire_entries.py" --alerts-json /dev/stdin --mode live >>"$HOME/workspace/copy-trader/fire.log" 2>&1 || true
-   fi
-   ```
-   How it works: when the watcher finds new posts, the same `$RESULT` JSON
-   that wakes the Trade Alerts chat is also piped into `fire_entries.py`.
-   Entries only auto-fire while the ARMED file exists; the
-   `|| true` keeps a firing failure from breaking the alert wake. The
-   notifier hook needs no arming because it only relays text.
-
-## Arming / disarming
+Python 3.10 or newer and a Unix-like host with `fcntl`/directory-descriptor support are required. The project uses the Python standard library; no package installation is needed.
 
 ```bash
-python kill.py --arm      # create ARMED — entries may auto-fire in live mode
-python kill.py --disarm   # remove ARMED — watcher alerts become text-only again
-python kill.py --halt     # engage KILL — halts ALL order placement immediately
-python kill.py --reset    # clear KILL, back to prior arming state
-python kill.py --status   # show armed / halted state
+python3 run_tests.py
 ```
 
-Armed requires `ARMED` present AND `KILL` absent. When in doubt, `--halt`.
+The runner establishes temporary home/state/credential directories and blocks network access before discovering the tests. Its guards protect this reviewed suite against accidental I/O; they are not an operating-system sandbox for arbitrary hostile code. Use it as the verification entry point. Tests use dummy credentials, fake transports, explicit clocks, and local fixtures; they do not prove Robinhood's real schemas or behavior. The former tests that touched deployed home-directory files have been replaced.
 
-## Dry-run vs live
+The proposed Linux CI definition is in `docs/security-tests.workflow.yml`. It is a review template, not an installed workflow: the publishing credential lacks GitHub `workflow` scope. An authorized maintainer can review and install it under `.github/workflows/`. No remote CI result is claimed.
 
-- `fire_entries.py --mode dry_run` (default): builds a dry_run
-  `MCPClient` — no order-mutating tool calls are allowed, and OAuth
-  tokens are not required. Use for all testing.
-- `fire_entries.py --mode live`: requires OAuth to be completed
-  (`get_valid_token` available), otherwise it exits non-zero with
-  "OAuth not completed; cannot fire live."
+## Paper CLI inputs
 
-**Standing rule:** while the market is closed, live testing waits for
-market hours *and* Silas's explicit go-ahead. No exceptions.
+A market fixture has exactly two top-level keys, `contracts` and `quotes`. Contract symbols use the 21-character OCC form: a six-character space-padded underlying, six date digits, `C` or `P`, and an eight-digit strike in thousandths.
 
-## State files
+Example `market.json`:
 
-| File | Contents | Notes |
-|---|---|---|
-| `ledger.jsonl` | One audit record per order attempt (entry + exit) | append-only; never delete |
-| `positions.json` | Open tailed positions the engine is managing | read/written by entry_engine / run_exits.py |
-| `notifications.jsonl` | Queue of chat-ready notifications, one JSON object per line | drained + truncated by the notifier hook every ~60s |
-| `.tokens.json` | OAuth client registration + tokens | **0600**, never paste contents into chat |
-| `ARMED` / `KILL` | Empty marker files | arming state; see `kill.py` |
-| `fire.log` | fire_entries.py stdout from the watcher pipe | rotation: keep small, inspect on failures |
+```json
+{
+  "contracts": [
+    {
+      "underlying": "SPY",
+      "expiry": "2026-09-25",
+      "strike": 700.0,
+      "option_type": "call",
+      "contract_symbol": "SPY   260925C00700000"
+    }
+  ],
+  "quotes": {
+    "SPY   260925C00700000": {
+      "contract_symbol": "SPY   260925C00700000",
+      "bid": 0.95,
+      "ask": 1.0,
+      "as_of": "2026-09-21T15:00:00+00:00"
+    }
+  }
+}
+```
+
+Example `alerts.json`:
+
+```json
+{
+  "alerts": [
+    {
+      "id": "100",
+      "handle": "cassytrades",
+      "source_id": "paper-fixture-source",
+      "type": "entry",
+      "text": "$SPY 700c 9/25 1.00 entry",
+      "posted_at": "2026-09-21T15:00:00+00:00",
+      "url": "https://x.com/cassytrades/status/100"
+    }
+  ]
+}
+```
+
+These are format examples with historical timestamps. The CLI uses the current clock: update timestamps and all corresponding contract/expiry fields for a paper exercise during supported market hours. Quote age is limited to 30 seconds; alert age defaults to five minutes. Stale fixtures are rejected. Reusing a reserved alert ID will not trade again, even if its text changes. The automated tests provide reproducible examples with explicit clocks without relaxing these checks.
+
+Use a dedicated namespace for the exercise:
+
+```bash
+export COPYTRADER_STATE_DIR="$HOME/.local/state/copypasta-paper-demo"
+python3 kill.py --arm --mode dry_run --account demo
+python3 fire_entries.py --mode dry_run --account demo --market-json market.json --alerts-json alerts.json
+python3 run_exits.py --mode dry_run --account demo --market-json market.json
+python3 notifications.py --mode dry_run --account demo
+python3 kill.py --disarm --mode dry_run --account demo
+```
+
+Keep `--account` and `COPYTRADER_STATE_DIR` consistent across commands. `fire_entries.py` prints deterministic result messages and a JSON summary. The notification command renders committed fill/status events from state; it can repeat information already printed by the originating CLI. There is no live scheduler or watcher installed by these commands.
+
+## State and operational controls
+
+Default state lives outside the checkout under:
+
+```text
+~/.local/state/copypasta/<mode>/<account>/
+  state.json
+  .lock
+  ARMED
+  KILL
+```
+
+`COPYTRADER_STATE_DIR` selects another root. The default paper account is `paper`; live state requires an explicit account identifier. The state envelope records mode and account. One process lock covers the entire read/check/intent/submission/update transaction; writes are atomic. Invalid, corrupt, or missing live state is never treated as an empty account.
+
+Order intents are saved before submission. Pending, partial, and unknown outcomes reserve their identity and stop further submissions until reconciled. Holdings, exit latches, and realized P&L change only from confirmed cumulative fills; a timeout is not a rejection or a reason to resubmit. Normalized broker responses must preserve the order's contract, side, quantity, and client idempotency identifier.
+
+`--halt` creates `KILL`; `--disarm` removes `ARMED`. Both stop new entries **and automated exits**. They do not cancel orders already submitted, liquidate positions, or ensure flat holdings. Existing orders and holdings need manual monitoring. `--reset` only clears the kill marker: it does not resolve unknown orders or clear durable reconciliation halts. If the arm marker remains, clearing `KILL` restores eligibility for otherwise valid paper work.
+
+Legacy `positions.json`, `ledger.jsonl`, notification queues, and checkout-level markers are never automatically imported. Do not copy mixed paper/live history into the new state. Any eventual live migration needs separate broker reconciliation and review.
+
+## Notifications and external installations
+
+Notifications use fixed message codes, bounded numeric fields, and validated contract symbols. Alert text, arbitrary handles/URLs, broker descriptions, and exception bodies are not forwarded to an LLM. The notifier shell script only invokes the deterministic renderer; it does not source Hatch or wake an agent. Its repository hook definition is disabled.
+
+**Updating this repository does not disable an older hook already installed elsewhere.** Manually disable the old external notifier/watcher/scheduler configuration before reviewing any replacement deployment. The X watcher, `trade-post-watcher.sh`, Hatch runtime, recipient-agent permissions, and host scheduler are absent from this repository. Their safety and installed state remain unknown.
+
+## Credentials and broker integration
+
+No credentials are needed for paper runs or tests. OAuth files now belong in `~/.local/share/copypasta/credentials`, or an explicit absolute `COPYTRADER_CREDENTIAL_DIR` outside any Git checkout. The directory must be private (`0700`), files private (`0600`), and paths must not traverse symlinks. Writes are atomic. Legacy credentials beside the code are not imported.
+
+The OAuth implementation accepts only pinned HTTPS endpoints, refuses redirects, and binds a full loopback callback URL to a saved PKCE verifier and single-use, age-limited state. Its exchange CLI accepts the callback through stdin, not an argument. Do not paste callback URLs, codes, tokens, or verifiers into agent conversations or shell arguments. OAuth authorization is a separate reviewed operation, not a paper setup step.
+
+The MCP adapter allows exact named tools and validates a conservative schema subset. Unknown tools, unsupported schemas, tool errors, response-ID mismatches, and malformed fills fail closed. Its normalized argument/result shapes are **offline contracts, not verified Robinhood account schemas**. An advertised tool name alone does not establish compatibility or permission.
+
+Live execution has independent blocks in the entry/exit CLIs, live arming, and the transport's source-level `LIVE_TRADING_ENABLED = False` gate. There is no environment override or supported live-enable command. Removing one check is not a rollout procedure. Conditional-order support remains unavailable.
+
+## Files
+
+| Area | Files |
+|---|---|
+| Admission, parser, policy | `admission.py`, `resolver.py`, `config.py` |
+| Trading decisions and confirmed fills | `entry_engine.py`, `exits.py`, `order_state.py` |
+| State, controls, accounting | `trade_state.py`, `kill.py`, `ledger.py` |
+| Offline CLI/data | `paper_client.py`, `fire_entries.py`, `run_exits.py` |
+| Broker boundary and credentials | `mcp_client.py`, `oauth_client.py` |
+| Deterministic notifications | `notifications.py`, `notifier/` |
+| Verification | `run_tests.py`, `tests/` |
+
+The market calendar supports only 2026–2027 and is not a complete instrument-specific trading calendar. P&L excludes fees. See [SECURITY.md](SECURITY.md) before considering any live integration.
