@@ -10,7 +10,7 @@ Baseline: `bd90d8cc5b2d369c9a502bc9c6d82cfbb948d812`. Authorized scope: repair t
 - [x] Validate source admission/freshness/replay and enforce strict trade intent; make notifications safe without an LLM/tool wake.
 - [x] Remove production side effects from tests and add an isolated, network-denied test runner and a reviewable CI definition.
 - [x] Review fixes independently, verify regressions and update operator/security documentation with remaining external integration requirements.
-- [ ] Commit, push, open ready-for-review PR for Muse, and verify published head.
+- [x] Commit, push, open ready-for-review PR for Muse, and verify published head.
 
 Design: explicit state context identifies mode and account; a process lock covers read/decision/order/update, with durable intent before external effects. Live state must be initialized and reconciled and unknown orders stop further mutation. Paper mode uses separate local state and no OAuth. Only exact supported MCP contracts are accepted; unsupported broker schemas remain blocked pending read-only verification. Notification delivery uses deterministic text with no agent tool authority. External watcher/Hatch runtime/agent permissions are not present and cannot be certified by this PR.
 
@@ -24,3 +24,5 @@ Design: explicit state context identifies mode and account; a process lock cover
 - Python source syntax, notifier shell syntax, `git diff --check`, and a high-confidence secret-pattern scan pass. Scan found no private-key/GitHub/OpenAI token patterns; this is not an exhaustive secret detector or malware attestation.
 - Prepared `docs/security-tests.workflow.yml` with read-only permissions, a commit-pinned checkout action and no persisted GitHub credentials. GitHub rejected the initial push when this file was under `.github/workflows/` because the current OAuth credential lacks `workflow` scope. The definition is published as a review template; remote CI is not installed or claimed to have passed.
 - Source/runtime limits: actual broker schema, provider idempotency and reconciliation semantics, producer authentication deployment, installed watcher/Hatch hooks, agent permissions, host provenance, and activation remain unverified. Live CLIs, live arming, and transport mutation are deliberately disabled. Existing external hooks were not changed.
+
+Publication: [PR #1](https://github.com/skwongg/copypasta/pull/1) is open and ready for review from `fix/security-audit` into `main`. GitHub confirmed the implementation commit `ccc536f71ec7a5f630d4ce7ff726a37896856dd2`; no workflow is active and there are no remote CI results. The follow-up documentation commit only records this publication evidence. No merge, deployment, OAuth session, or broker access occurred.
