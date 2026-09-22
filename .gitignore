@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.oauth_client.json
+ledger.jsonl
+ARMED
+*.log
