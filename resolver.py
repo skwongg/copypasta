@@ -10,47 +10,57 @@ MCP interface (the real client implements this; code against exactly this):
                               strike: float, option_type: str /*"call"|"put"*/)
         -> list[dict]  # {"contract_symbol","expiry","strike","option_type"}
 
-Per-trader expiry defaults come from ~/workspace/trade-watch/trader_config.json
-(CassyTrades -> "0DTE", clintoptions -> null, capricekayem -> null).
-Trading-day / holiday logic mirrors build_dashboard_data.py (not imported).
+Per-trader expiry defaults are supplied explicitly or through the shared safe
+configuration at call time. Importing this module never reads user files.
 """
 
 from __future__ import annotations
 
-import json
-import os
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
-CONFIG_PATH = os.path.expanduser("~/workspace/trade-watch/trader_config.json")
 MARKET_TZ = ZoneInfo("America/Los_Angeles")
 
-# NYSE holidays (options don't trade); 2026-2027. Keep in sync with
-# build_dashboard_data.py.
+# Supported NYSE holiday dates, 2026-2027. Keep in sync with config.py.
+# https://www.nyse.com/trade/hours-calendars (verified 2026-09-21).
 MARKET_HOLIDAYS = frozenset([
     # 2026
     date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
     date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
     date(2026, 11, 26), date(2026, 12, 25),
     # 2027
-    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 4, 2),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
     date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
     date(2027, 11, 25), date(2027, 12, 24),
 ])
 
-# $TICKER STRIKE SIDE, e.g. "$SPY 759 PUTS", "$QQQ 734c". Side may be a word
-# (calls/puts) or a single letter glued to the strike (c/p), case-insensitive.
+# Parsing intentionally accepts a small, single-contract grammar. Unrecognized
+# numeric material or contradictory intent needs manual review, never guessing.
 CONTRACT_RE = re.compile(
-    r"\$([A-Z]{1,5})\s+(\d+(?:\.\d+)?)\s*(calls?|puts?|[cp])\b", re.IGNORECASE
+    r"\$([A-Z]{1,5})\s+([0-9]+(?:\.[0-9]{1,3})?)\s*(calls?|puts?|[cp])\b", re.IGNORECASE
 )
 ZERO_DTE_RE = re.compile(r"(?i)\b0\s*dte\b")
-# Explicit M/D expiry, optionally with "exp" prefix: "9/18", "09/18", "exp 9/18".
-MD_EXPIRY_RE = re.compile(r"(?i)(?:\bexp\w*\s*)?(\d{1,2})/(\d{1,2})\b")
-# Current-price clause, e.g. "now @ 2.20" — this is NOT the entry premium.
-NOW_PRICE_RE = re.compile(r"(?i)\bnow\s*(?:@\s*)?\d+(?:\.\d+)?")
-BARE_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+MD_EXPIRY_RE = re.compile(
+    r"(?i)(?<![\w./])(?:exp(?:iry|iration)?\s*:?\s*)?([0-9]{1,2})/([0-9]{1,2})(?![\w/.])"
+)
+NUMBER = r"[+-]?(?:[0-9]+\.[0-9]+|\.[0-9]+|[0-9]+)"
+PRICE_RE = re.compile(r"(?<![\w.+-])" + NUMBER + r"(?![\w.])")
+NOW_PRICE_RE = re.compile(r"(?i)\bnow\s*(?:@\s*|\$\s*)?(" + NUMBER + r")(?![\w.])")
+QUANTITY_RE = re.compile(
+    r"(?i)\b(?:qty\s*[:=]?\s*[0-9]+|x[0-9]+|[0-9]+\s*(?:contracts?|lots?)|[0-9]+x)(?![\w.])"
+)
+PERCENT_RE = re.compile(r"(?<![\w.])" + NUMBER + r"\s*%")
+NONFINITE_RE = re.compile(r"(?i)\b(?:nan|inf(?:inity)?)\b")
+UNSUPPORTED_INTENT_RE = re.compile(
+    r"(?i)\b(?:no|not|never|don['’]?t|didn['’]?t|won['’]?t|wouldn['’]?t|"
+    r"avoid|cancel(?:led|ed)?|watch(?:ing|list)?|wait(?:ing)?|if|unless|maybe|might|"
+    r"sell(?:ing)?|sold|exit(?:ed|ing)?|trim(?:med|ming)?|clos(?:e|ed|ing)|"
+    r"short(?:ing)?|roll(?:ed|ing)?|spreads?|stop(?:ped)?|targets?|"
+    r"scratch(?:ed)?|missed|hypothetical|example)\b"
+)
 
 
 @dataclass
@@ -74,30 +84,6 @@ class Ambiguous:
 # helpers
 # --------------------------------------------------------------------------
 
-def _load_trader_defaults() -> dict[str, str | None]:
-    """handle(lowercased) -> default_expiry ("0DTE" / None). Missing file -> {}."""
-    try:
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    return {
-        k.lower(): (v or {}).get("default_expiry")
-        for k, v in cfg.items()
-        if not k.startswith("_") and isinstance(v, dict)
-    }
-
-
-_TRADER_DEFAULTS: dict[str, str | None] | None = None
-
-
-def trader_defaults() -> dict[str, str | None]:
-    global _TRADER_DEFAULTS
-    if _TRADER_DEFAULTS is None:
-        _TRADER_DEFAULTS = _load_trader_defaults()
-    return _TRADER_DEFAULTS
-
-
 def trading_day(ts_str: str) -> date | None:
     """Market-tz date of ts if it is a trading day, else None.
 
@@ -111,6 +97,8 @@ def trading_day(ts_str: str) -> date | None:
     if dt.tzinfo is None:
         return None
     day = dt.astimezone(MARKET_TZ).date()
+    if day.year not in (2026, 2027):
+        return None  # Calendar coverage is explicit; do not guess unknown holidays.
     if day.weekday() >= 5 or day in MARKET_HOLIDAYS:
         return None
     return day
@@ -124,7 +112,8 @@ def _market_date(ts_str: str) -> date | None:
         return None
     if dt.tzinfo is None:
         return None
-    return dt.astimezone(MARKET_TZ).date()
+    day = dt.astimezone(MARKET_TZ).date()
+    return day if day.year in (2026, 2027) else None
 
 
 def occ_symbol(underlying: str, expiry: str, strike: float, option_type: str) -> str:
@@ -147,77 +136,126 @@ def _side_to_option_type(side: str) -> str:
     return "call" if s.startswith("c") else "put"
 
 
-def _entry_premium(text: str, side_end: int) -> float | None:
-    """Trader's stated entry premium: the first price token after the side word.
+def _entry_premium(text: str, side_end: int) -> float | None | Ambiguous:
+    """Parse one entry price, after removing explicitly typed non-price fields.
 
-    "now @ 2.20" clauses describe the CURRENT price, not the entry, so they
-    are stripped before scanning. No price token -> None (never proxied).
+    A number is never taken from a date, DTE, quantity, percentage, or current
+    price. Decimal bare prices and explicitly marked integer prices are
+    supported; unexplained integers, malformed numbers, and multiple prices
+    require manual review.
     """
-    tail = NOW_PRICE_RE.sub("", text[side_end:])
-    m = BARE_NUM_RE.search(tail)
-    return float(m.group(0)) if m else None
+    tail = text[side_end:]
+    if any(char in tail for char in "−–—﹣＋﹢"):
+        return Ambiguous("unsupported numeric sign or range", [])
+    for pattern in (MD_EXPIRY_RE, ZERO_DTE_RE, NOW_PRICE_RE, QUANTITY_RE, PERCENT_RE):
+        tail = pattern.sub(" ", tail)
+    if NONFINITE_RE.search(tail):
+        return Ambiguous("entry premium must be finite and positive", [])
+    matches = list(PRICE_RE.finditer(tail))
+    if len(matches) > 1:
+        return Ambiguous("multiple possible entry premiums", [])
+    residue = PRICE_RE.sub(" ", tail)
+    allowed_words = {"entry", "premium", "at", "buy", "buying", "bought", "bto", "in"}
+    if any(word.lower() not in allowed_words for word in re.findall(r"[a-zA-Z]+", residue)):
+        return Ambiguous("unsupported entry text requires manual review", [])
+    if "?" in residue:
+        return Ambiguous("question is not an unambiguous trade instruction", [])
+    # Reject scientific notation, comma-separated prices, unsupported DTE/date
+    # syntax and a numeric suffix/prefix that was only partially recognized.
+    if any(c.isnumeric() for c in residue) or re.search(r"[.,/+-]\s*[.,/+-]", residue):
+        return Ambiguous("unsupported or malformed numeric field", [])
+    if not matches:
+        if re.search(r"(?i)(?:@|\$|\b(?:entry|premium)\s*[:=])\s*$", tail):
+            return Ambiguous("entry price marker has no price", [])
+        return None
+    match = matches[0]
+    token = match.group(0)
+    before = tail[:match.start()]
+    after = tail[match.end():]
+    # Do not accept a substring of 1,234.56, - 1.5, .5.6, 1/2, or a range.
+    if re.search(r"[.,/+-]\s*$", before) or re.match(r"\s*[./+-]", after):
+        return Ambiguous("unsupported or malformed entry premium", [])
+    if "." not in token and not (
+        re.search(r"(?i)(?:@|\$|\b(?:entry|premium|at)\s*[:=]?)\s*$", before)
+        or re.match(r"(?i)\s*(?:entry|premium)\b", after)
+    ):
+        return Ambiguous("unmarked integer could be quantity rather than premium", [])
+    value = float(token)
+    if not math.isfinite(value) or value <= 0 or token.startswith(("+", "-")):
+        return Ambiguous("entry premium must be finite, positive and unsigned", [])
+    return value
 
 
-def _explicit_expiry(text: str, posted_at_iso: str) -> tuple[str, str] | Ambiguous:
-    """Return (expiry "YYYY-MM-DD", kind) for an explicit expiry in the text,
-    else an Ambiguous if an explicit pattern is present but unusable."""
-    if ZERO_DTE_RE.search(text):
+def _explicit_expiry(text: str, posted_at_iso: str) -> tuple[str, str] | Ambiguous | None:
+    """Resolve exactly one explicit expiry; never select the first of several."""
+    zeros = list(ZERO_DTE_RE.finditer(text))
+    dates = list(MD_EXPIRY_RE.finditer(text))
+    if len(zeros) + len(dates) > 1:
+        return Ambiguous("multiple expiry indications require manual review", [])
+    if zeros:
         tday = trading_day(posted_at_iso)
         if tday is None:
-            return Ambiguous(
-                reason="cannot establish trading day for 0DTE "
-                       "(posted_at missing, naive, unparseable, or not a trading day)",
-                candidates=[],
-            )
+            return Ambiguous("cannot establish trading day for 0DTE", [])
         return tday.isoformat(), "explicit 0DTE"
-    m = MD_EXPIRY_RE.search(text)
-    if m:
+    if dates:
+        m = dates[0]
         post_day = _market_date(posted_at_iso)
         if post_day is None:
-            return Ambiguous(
-                reason="cannot establish post year for M/D expiry "
-                       "(posted_at missing, naive, or unparseable)",
-                candidates=[],
-            )
-        month, day = int(m.group(1)), int(m.group(2))
+            return Ambiguous("cannot establish post year for M/D expiry", [])
         try:
-            exp = date(post_day.year, month, day)
+            exp = date(post_day.year, int(m.group(1)), int(m.group(2)))
         except ValueError:
-            return Ambiguous(reason=f"invalid calendar date in expiry: {m.group(0)}",
-                             candidates=[])
+            return Ambiguous("invalid calendar date in expiry", [])
         if exp < post_day:
-            # Day-trading context: a past M/D is almost certainly this year's
-            # date; never guess next year.
-            return Ambiguous(reason=f"expiry {exp.isoformat()} is before the post date; "
-                                    "refusing to guess next year",
-                             candidates=[])
+            return Ambiguous("expiry is before post date; refusing to guess next year", [])
         if exp.weekday() >= 5 or exp in MARKET_HOLIDAYS:
-            return Ambiguous(reason=f"expiry {exp.isoformat()} is not a trading day",
-                             candidates=[])
-        return exp.isoformat(), f"explicit {m.group(0)}"
-    return None  # no explicit expiry pattern at all
+            return Ambiguous("expiry is not a trading day", [])
+        return exp.isoformat(), "explicit M/D"
+    return None
 
 
 # --------------------------------------------------------------------------
 # main entry point
 # --------------------------------------------------------------------------
 
-def resolve(post_text: str, handle: str, posted_at_iso: str, mcp) -> ResolvedContract | Ambiguous:
-    """Resolve a trade-post alert to one exact options contract."""
-    text = post_text or ""
+def resolve(post_text: str, handle: str, posted_at_iso: str, mcp, *,
+            defaults: dict[str, str | None] | None = None) -> ResolvedContract | Ambiguous:
+    """Resolve a supported alert and independently verify the returned identity.
 
-    m = CONTRACT_RE.search(text)
-    if m is None:
-        return Ambiguous(
-            reason="could not parse ticker/strike/side from post text "
-                   '(expected like "$SPY 759 PUTS" or "$QQQ 734c")',
-            candidates=[],
-        )
+    ``defaults`` permits explicit caller-owned trader settings and isolated
+    tests. Otherwise the shared configuration is consulted at call time.
+    Raw provider errors are never included in the returned reason.
+    """
+    if not isinstance(post_text, str) or len(post_text) > 10000:
+        return Ambiguous("post text must be a bounded string", [])
+    if not isinstance(handle, str):
+        return Ambiguous("trader handle must be a string", [])
+    text = post_text
+    if not text.isascii() or any(ord(char) < 32 and char not in "\t\r\n" for char in text):
+        return Ambiguous("unsupported post characters require manual review", [])
+    if UNSUPPORTED_INTENT_RE.search(text):
+        return Ambiguous("unsupported or contradictory trade intent", [])
+    contracts = list(CONTRACT_RE.finditer(text))
+    if len(contracts) != 1:
+        return Ambiguous("expected exactly one ticker/strike/side contract", [])
+    m = contracts[0]
+    outside = text[:m.start()] + " " + text[m.end():]
+    if re.search(r"(?i)\$[a-z]|\b(?:calls?|puts?)\b|[0-9]\s*[cp]\b", outside):
+        return Ambiguous("additional contract or side indication", [])
+    prefix = text[:m.start()]
+    for pattern in (MD_EXPIRY_RE, ZERO_DTE_RE, QUANTITY_RE, PERCENT_RE):
+        prefix = pattern.sub(" ", prefix)
+    if any(word.lower() not in {"buy", "buying", "bought", "bto", "in", "entry"}
+           for word in re.findall(r"[a-zA-Z]+", prefix)) or "?" in prefix:
+        return Ambiguous("unsupported entry prefix requires manual review", [])
+    if any(c.isnumeric() for c in prefix):
+        return Ambiguous("unexplained number before contract", [])
     underlying = m.group(1).upper()
     strike = float(m.group(2))
+    if not math.isfinite(strike) or strike <= 0 or strike >= 100000:
+        return Ambiguous("strike is not representable as an OCC contract", [])
     option_type = _side_to_option_type(m.group(3))
 
-    # --- expiry: explicit beats trader default; never guess ---
     inferred_expiry = False
     explicit = _explicit_expiry(text, posted_at_iso)
     if isinstance(explicit, Ambiguous):
@@ -225,202 +263,63 @@ def resolve(post_text: str, handle: str, posted_at_iso: str, mcp) -> ResolvedCon
     if explicit is not None:
         expiry, _kind = explicit
     else:
-        default = trader_defaults().get((handle or "").lower())
+        if defaults is None:
+            # config has no user-file reads unless explicitly configured.
+            from config import default_expiry_for
+            default = default_expiry_for(handle)
+        else:
+            default = {k.lstrip("@").lower(): v for k, v in defaults.items()}.get(
+                handle.lstrip("@").lower())
         if default is None:
-            return Ambiguous(
-                reason=f"no explicit expiry in post and no default_expiry "
-                       f"for trader {handle!r}",
-                candidates=[],
-            )
-        if default.lower().replace(" ", "") != "0dte":
-            return Ambiguous(
-                reason=f"unsupported default_expiry {default!r} for trader {handle!r}",
-                candidates=[],
-            )
+            return Ambiguous("no explicit expiry and no configured trader default", [])
+        if not isinstance(default, str) or default.lower().replace(" ", "") != "0dte":
+            return Ambiguous("unsupported trader default_expiry", [])
         tday = trading_day(posted_at_iso)
         if tday is None:
-            return Ambiguous(
-                reason="cannot establish trading day for inferred 0DTE "
-                       "(posted_at missing, naive, unparseable, or not a trading day)",
-                candidates=[],
-            )
+            return Ambiguous("cannot establish trading day for inferred 0DTE", [])
         expiry = tday.isoformat()
         inferred_expiry = True
 
     premium = _entry_premium(text, m.end())
-
-    # --- resolution: exactly one exact match, or Ambiguous ---
+    if isinstance(premium, Ambiguous):
+        return premium
+    expected_symbol = occ_symbol(underlying, expiry, strike, option_type)
     try:
-        results = mcp.find_option_contracts(underlying, expiry, strike, option_type) or []
-    except Exception as e:  # noqa: BLE001 - MCP failure must not resolve silently
-        return Ambiguous(reason=f"contract lookup failed: {e}", candidates=[])
+        results = mcp.find_option_contracts(underlying, expiry, strike, option_type)
+    except Exception:  # Provider messages are untrusted data, not notifications.
+        return Ambiguous("contract lookup failed", [])
+    if not isinstance(results, list):
+        return Ambiguous("contract lookup returned an invalid response", [])
 
-    def _strike_eq(c) -> bool:
-        try:
-            return float(c.get("strike")) == strike
-        except (TypeError, ValueError):
+    def identity_matches(contract) -> bool:
+        if not isinstance(contract, dict):
             return False
+        raw_strike = contract.get("strike")
+        if isinstance(raw_strike, bool):
+            return False
+        try:
+            found_strike = float(raw_strike)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(found_strike) or found_strike != strike:
+            return False
+        if (contract.get("expiry") != expiry
+                or contract.get("option_type") != option_type
+                or contract.get("contract_symbol") != expected_symbol):
+            return False
+        for field in ("underlying", "underlying_symbol", "ticker"):
+            if field in contract and contract[field] != underlying:
+                return False
+        # Some providers additionally return 'symbol' as the option symbol.
+        if "symbol" in contract and contract["symbol"] not in (underlying, expected_symbol):
+            return False
+        return True
 
-    exact = [
-        c for c in results
-        if isinstance(c, dict)
-        and c.get("expiry") == expiry
-        and _strike_eq(c)
-        and c.get("option_type") == option_type
-    ]
-    if len(exact) == 1:
-        c = exact[0]
-        symbol = c.get("contract_symbol") or occ_symbol(underlying, expiry, strike, option_type)
-        return ResolvedContract(
-            underlying=underlying,
-            expiry=expiry,
-            strike=strike,
-            option_type=option_type,
-            contract_symbol=symbol,
-            premium=premium,
-            inferred_expiry=inferred_expiry,
-        )
-    if not exact:
-        return Ambiguous(reason="no contract matched (expiry, strike, option_type)",
-                         candidates=list(results))
-    return Ambiguous(reason=f"{len(exact)} contracts matched (expiry, strike, option_type); "
-                            "refusing to pick closest",
-                     candidates=exact)
-
-
-# --------------------------------------------------------------------------
-# self-test (fake MCP, no network)
-# --------------------------------------------------------------------------
-
-def _one_contract_mcp(underlying, expiry, strike, option_type):
-    """Fake MCP: returns exactly the requested contract (with OCC symbol)."""
-    cp = "C" if option_type == "call" else "P"
-    return [{
-        "contract_symbol": occ_symbol(underlying, expiry, strike, option_type),
-        "expiry": expiry,
-        "strike": strike,
-        "option_type": option_type,
-    }]
-
-
-class _FakeMCP:
-    def __init__(self, fn):
-        self._fn = fn
-        self.calls = []
-
-    def find_option_contracts(self, underlying, expiry, strike, option_type):
-        self.calls.append((underlying, expiry, strike, option_type))
-        return self._fn(underlying, expiry, strike, option_type)
-
-
-def _run_self_tests() -> bool:
-    WED = "2026-09-23T08:00:00-07:00"   # Wednesday, a trading day
-    SAT = "2026-09-26T08:00:00-07:00"   # Saturday
-    cases = []
-    ok = True
-
-    def check(name, cond, detail=""):
-        nonlocal ok
-        status = "PASS" if cond else "FAIL"
-        if not cond:
-            ok = False
-        cases.append((name, status, detail))
-        print(f"[{status}] {name}" + (f" — {detail}" if detail and not cond else ""))
-
-    # 1. CassyTrades "$SPY 759 PUTS 1.85" on a Wednesday -> 0DTE inferred, premium 1.85
-    r = resolve("$SPY 759 PUTS 1.85", "CassyTrades", WED, _FakeMCP(_one_contract_mcp))
-    check("cassy 0DTE inferred", isinstance(r, ResolvedContract)
-          and r.expiry == "2026-09-23" and r.strike == 759.0
-          and r.option_type == "put" and r.premium == 1.85
-          and r.inferred_expiry is True
-          and r.contract_symbol == "SPY   260923P00759000"
-          and len(r.contract_symbol) == 21,
-          repr(r))
-
-    # 2. Clint "$QQQ 734c 0.56 0DTE" -> explicit 0DTE, trailing-c side, premium 0.56
-    r = resolve("$QQQ 734c 0.56 0DTE", "clintoptions", WED, _FakeMCP(_one_contract_mcp))
-    check("clint explicit 0DTE", isinstance(r, ResolvedContract)
-          and r.expiry == "2026-09-23" and r.strike == 734.0
-          and r.option_type == "call" and r.premium == 0.56
-          and r.inferred_expiry is False
-          and r.contract_symbol == "QQQ   260923C00734000",
-          repr(r))
-
-    # 3. "now @ X" is the current price, not the entry premium
-    r = resolve("$SPY 759 PUTS 1.85 now @ 2.20", "CassyTrades", WED,
-               _FakeMCP(_one_contract_mcp))
-    check("now @ not entry premium", isinstance(r, ResolvedContract) and r.premium == 1.85,
-          repr(r))
-
-    # 3b. only a "now @ X" price -> no entry premium disclosed
-    r = resolve("$SPY 759 PUTS now @ 2.20", "CassyTrades", WED, _FakeMCP(_one_contract_mcp))
-    check("now @ only -> premium None", isinstance(r, ResolvedContract) and r.premium is None,
-          repr(r))
-
-    # 4. unpriced post -> premium None (still resolves)
-    r = resolve("$SPY 759 PUTS", "CassyTrades", WED, _FakeMCP(_one_contract_mcp))
-    check("unpriced -> premium None", isinstance(r, ResolvedContract) and r.premium is None,
-          repr(r))
-
-    # 5. weekend post -> Ambiguous (0DTE needs a trading day)
-    r = resolve("$SPY 759 PUTS 1.85 0DTE", "CassyTrades", SAT, _FakeMCP(_one_contract_mcp))
-    check("weekend post -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    # 6. multiple candidates -> Ambiguous with candidates listed
-    def two(underlying, expiry, strike, option_type):
-        return [
-            {"contract_symbol": occ_symbol(underlying, expiry, strike, option_type) + "A",
-             "expiry": expiry, "strike": strike, "option_type": option_type},
-            {"contract_symbol": occ_symbol(underlying, expiry, strike, option_type) + "B",
-             "expiry": expiry, "strike": strike, "option_type": option_type},
-        ]
-    r = resolve("$SPY 759 PUTS 1.85 0DTE", "clintoptions", WED, _FakeMCP(two))
-    check("2 candidates -> Ambiguous", isinstance(r, Ambiguous) and len(r.candidates) == 2,
-          repr(r))
-
-    # 6b. zero candidates -> Ambiguous
-    r = resolve("$SPY 759 PUTS 1.85 0DTE", "clintoptions", WED,
-               _FakeMCP(lambda *a: []))
-    check("0 candidates -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    # 7. capricekayem has no default and no explicit expiry -> Ambiguous
-    r = resolve("$SPY 759 PUTS 1.85", "capricekayem", WED, _FakeMCP(_one_contract_mcp))
-    check("capricekayem no-expiry -> Ambiguous",
-          isinstance(r, Ambiguous) and "no explicit expiry" in r.reason, repr(r))
-
-    # 8. past M/D expiry -> Ambiguous (never guess next year)
-    r = resolve("$SPY 759 PUTS 1.85 exp 9/18", "clintoptions", WED,
-               _FakeMCP(_one_contract_mcp))
-    check("past M/D -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    # 8b. future M/D expiry -> resolves explicitly
-    r = resolve("$SPY 759 PUTS 1.85 exp 9/25", "clintoptions", WED,
-               _FakeMCP(_one_contract_mcp))
-    check("future M/D explicit", isinstance(r, ResolvedContract)
-          and r.expiry == "2026-09-25" and r.inferred_expiry is False, repr(r))
-
-    # 9. naive posted_at -> Ambiguous (fail closed)
-    r = resolve("$SPY 759 PUTS 1.85", "CassyTrades", "2026-09-23T08:00:00",
-               _FakeMCP(_one_contract_mcp))
-    check("naive posted_at -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    # 9b. missing posted_at -> Ambiguous
-    r = resolve("$SPY 759 PUTS 1.85", "CassyTrades", "", _FakeMCP(_one_contract_mcp))
-    check("missing posted_at -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    # 10. unparsable contract (no side) -> Ambiguous, never guess side
-    r = resolve("$SPY 759 1.85", "CassyTrades", WED, _FakeMCP(_one_contract_mcp))
-    check("no side -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    # 11. MCP lookup error -> Ambiguous, not a crash
-    def boom(*a):
-        raise RuntimeError("mcp down")
-    r = resolve("$SPY 759 PUTS 1.85", "CassyTrades", WED, _FakeMCP(boom))
-    check("mcp error -> Ambiguous", isinstance(r, Ambiguous), repr(r))
-
-    print(f"\n{sum(1 for _, s, _ in cases if s == 'PASS')}/{len(cases)} passed")
-    return ok
-
-
-if __name__ == "__main__":
-    raise SystemExit(0 if _run_self_tests() else 1)
+    exact = [c for c in results if identity_matches(c)]
+    if len(exact) != 1:
+        return Ambiguous("contract lookup did not return exactly one verified OCC identity", [])
+    return ResolvedContract(
+        underlying=underlying, expiry=expiry, strike=strike,
+        option_type=option_type, contract_symbol=expected_symbol,
+        premium=premium, inferred_expiry=inferred_expiry,
+    )
