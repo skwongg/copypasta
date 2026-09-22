@@ -59,7 +59,7 @@ class ExitMonitor:
                     position = next(p for p in tx.data['positions'] if p['position_id'] == position_id)
                     symbol = position['contract_symbol']
                     # Executable bid, not stale last-trade or an optimistic midpoint.
-                    quote = self.mcp.get_option_quote(symbol)
+                    quote = self.mcp.get_option_quote(position['option_id'])
                     quote_now = now + timedelta(seconds=max(0, time.monotonic() - started))
                     px = quote_price(quote, 'bid', quote_now, symbol)
                     ratio = px / position['fill_price']
@@ -80,8 +80,12 @@ class ExitMonitor:
                         limit = float(Decimal(str(px)).quantize(Decimal('.01'), rounding=ROUND_DOWN))
                         if limit <= 0:
                             raise OrderError('invalid_exit_limit')
-                        preview = self.mcp.review_option_order(symbol, 'sell', qty, 'limit', limit)
-                        if not isinstance(preview, dict) or preview.get('approved') is not True or preview.get('isError'):
+                        preview = self.mcp.review_option_order(option_id=position['option_id'],
+                                                              side='sell', position_effect='close',
+                                                              qty=qty, order_type='limit',
+                                                              limit_price=limit,
+                                                              underlying=position['underlying'])
+                        if not isinstance(preview, dict) or preview.get('approved') is not True:
                             notifications.append(self.note('rejected', 'preview_not_approved'))
                             return notifications
                         def validate_submission():
@@ -91,7 +95,9 @@ class ExitMonitor:
                             quote_price(quote, 'bid', current, symbol)
                         order = submit(tx, self.state, self.mcp, {
                             'intent_id': key, 'position_id': position_id, 'contract_symbol': symbol,
-                            'underlying': position['underlying'], 'side': 'sell', 'quantity': qty,
+                            'option_id': position['option_id'],
+                            'underlying': position['underlying'], 'side': 'sell',
+                            'position_effect': 'close', 'quantity': qty,
                             'order_type': 'limit', 'limit_price': limit, 'rung': rung,
                         }, now, paper_price=px, validate=validate_submission)
                         action = ('fired' if order['status'] == 'filled' else 'pending' if order['status'] in UNRESOLVED

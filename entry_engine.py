@@ -91,7 +91,7 @@ def process_entry(alert, mcp, mode='dry_run', *, state=None, policy=None, now=No
                 return result('needs_manual', 'missing_entry_price', mode, contract=contract)
             if not finite_positive(contract.premium):
                 return result('rejected', 'invalid_entry_price', mode)
-            quote = mcp.get_option_quote(contract.contract_symbol)
+            quote = mcp.get_option_quote(contract.option_id)
             quote_now = now + timedelta(seconds=max(0, time.monotonic() - started))
             ask = quote_price(quote, 'ask', quote_now, contract.contract_symbol)
             cap = Decimal(str(contract.premium)) * (Decimal('1') + Decimal(str(policy.max_slippage)))
@@ -112,8 +112,11 @@ def process_entry(alert, mcp, mode='dry_run', *, state=None, policy=None, now=No
             if realized <= -policy.daily_loss_cap:
                 return result('blocked', 'daily_loss_limit', mode)
             verify_broker_positions(tx.data, mcp)
-            preview = mcp.review_option_order(contract.contract_symbol, 'buy', qty, 'limit', float(limit))
-            if not isinstance(preview, dict) or preview.get('approved') is not True or preview.get('isError'):
+            preview = mcp.review_option_order(option_id=contract.option_id, side='buy',
+                                                 position_effect='open', qty=qty,
+                                                 order_type='limit', limit_price=float(limit),
+                                                 underlying=contract.underlying)
+            if not isinstance(preview, dict) or preview.get('approved') is not True:
                 return result('rejected', 'preview_not_approved', mode)
             def validate_submission():
                 current = now + timedelta(seconds=max(0, time.monotonic() - started))
@@ -124,9 +127,10 @@ def process_entry(alert, mcp, mode='dry_run', *, state=None, policy=None, now=No
             key = intent_id(state, 'entry:' + alert_key)
             order = submit(tx, state, mcp, {
                 'intent_id': key, 'position_id': key, 'alert_key': alert_key,
-                'contract_symbol': contract.contract_symbol, 'underlying': contract.underlying,
-                'side': 'buy', 'quantity': qty, 'order_type': 'limit', 'limit_price': float(limit),
-                'trader_premium': contract.premium,
+                'option_id': contract.option_id, 'contract_symbol': contract.contract_symbol,
+                'underlying': contract.underlying,
+                'side': 'buy', 'position_effect': 'open', 'quantity': qty, 'order_type': 'limit',
+                'limit_price': float(limit), 'trader_premium': contract.premium,
             }, now, paper_price=float(limit), validate=validate_submission)
             action = ('fired' if order['status'] == 'filled' else 'pending' if order['status'] in UNRESOLVED
                       else 'partially_filled' if order['filled_qty'] else 'rejected')

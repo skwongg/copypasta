@@ -16,12 +16,14 @@ from trade_state import TradingState, StateError
 
 NOW = datetime.fromisoformat("2026-09-21T17:00:00+00:00")
 SYMBOL = "QQQ   260921C00734000"
+OPTION_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def fixture(price=1.0):
-    return {"contracts": [{"underlying": "QQQ", "expiry": "2026-09-21", "strike": 734.0,
-                           "option_type": "call", "contract_symbol": SYMBOL}],
-            "quotes": {SYMBOL: {"contract_symbol": SYMBOL, "bid": price, "ask": price, "as_of": NOW.isoformat()}}}
+    return {"contracts": [{"option_id": OPTION_ID, "underlying": "QQQ", "expiry": "2026-09-21",
+                           "strike": 734.0, "option_type": "call", "contract_symbol": SYMBOL}],
+            "quotes": {OPTION_ID: {"option_id": OPTION_ID, "contract_symbol": SYMBOL, "bid": price,
+                                   "ask": price, "as_of": NOW.isoformat()}}}
 
 
 def alert(identity="test1", **changes):
@@ -52,7 +54,7 @@ class DryRunSecurityTests(unittest.TestCase):
             self.enter()
             monitor = ExitMonitor(self.client, state=self.state)
             for bid, remaining in ((1.5, 3), (3.0, 2), (4.0, 0)):
-                self.client.fixture["quotes"][SYMBOL]["bid"] = bid
+                self.client.fixture["quotes"][OPTION_ID]["bid"] = bid
                 notes = monitor.check(now=NOW)
                 self.assertEqual(notes[0]["kind"], "fired", notes)
                 self.assertEqual(self.state.snapshot()["positions"][0]["qty_remaining"], remaining)
@@ -69,10 +71,10 @@ class DryRunSecurityTests(unittest.TestCase):
     def test_stop_after_partial_take_profit_and_kill_during_exit_preview(self):
         self.enter()
         monitor = ExitMonitor(self.client, state=self.state)
-        self.client.fixture["quotes"][SYMBOL]["bid"] = 1.5
+        self.client.fixture["quotes"][OPTION_ID]["bid"] = 1.5
         monitor.check(now=NOW)
-        self.client.fixture["quotes"][SYMBOL]["bid"] = .39
-        with mock.patch.object(self.client, "review_option_order", side_effect=lambda *a: (kill.halt(self.state) or {"approved": True})):
+        self.client.fixture["quotes"][OPTION_ID]["bid"] = .39
+        with mock.patch.object(self.client, "review_option_order", side_effect=lambda *a, **k: (kill.halt(self.state) or {"approved": True})):
             notes = monitor.check(now=NOW)
         self.assertEqual(notes[0]["kind"], "blocked", notes)
         self.assertEqual(self.state.snapshot()["positions"][0]["qty_remaining"], 3)

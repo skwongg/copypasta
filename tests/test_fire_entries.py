@@ -17,7 +17,10 @@ from tests.test_dryrun import NOW, alert, fixture
 
 class FireEntriesSecurityTests(unittest.TestCase):
     def test_live_clis_refuse_before_reading_input_or_credentials(self):
-        with mock.patch("builtins.open", side_effect=AssertionError("file read")), redirect_stderr(io.StringIO()):
+        # Code gate off: live must refuse before touching input, credentials,
+        # or the network. (Production is armed; this exercises the gate layer.)
+        with mock.patch("mcp_client.LIVE_TRADING_ENABLED", False), \
+             mock.patch("builtins.open", side_effect=AssertionError("file read")), redirect_stderr(io.StringIO()):
             self.assertEqual(fire_entries.main(["--alerts-json", "absent", "--mode", "live"]), 2)
             self.assertEqual(run_exits.main(["--mode", "live"]), 2)
 

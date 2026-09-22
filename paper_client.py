@@ -21,12 +21,14 @@ class PaperClient:
     def find_option_contracts(self, underlying, expiry, strike, option_type):
         return [c for c in self.fixture['contracts'] if isinstance(c, dict)
                 and c.get('underlying') == underlying and c.get('expiry') == expiry
-                and c.get('strike') == strike and c.get('option_type') == option_type]
+                and c.get('strike') == strike and c.get('option_type') == option_type
+                and type(c.get('option_id')) is str and c['option_id']]
 
-    def get_option_quote(self, contract_symbol):
-        return self.fixture['quotes'].get(contract_symbol)
+    def get_option_quote(self, option_id):
+        return self.fixture['quotes'].get(option_id)
 
-    def review_option_order(self, contract_symbol, side, qty, order_type, limit_price=None):
+    def review_option_order(self, *, option_id, side, position_effect, qty, order_type,
+                            limit_price, underlying, underlying_type="equity"):
         return {'approved': True}  # local simulation only
 
     def get_orders(self, status=None):

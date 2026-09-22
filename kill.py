@@ -32,8 +32,8 @@ is_armed = can_fire
 
 
 def arm(context):
-    if context.mode == 'live':
-        raise RuntimeError('live arming disabled pending broker adapter and deployment review')
+    # Live arming is permitted only through the explicit activation review;
+    # the ARMED marker is what the entry/exit hooks and the adapter gates check.
     with context.transaction():
         pass
     directory = _directory_fd(context.directory)

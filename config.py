@@ -14,7 +14,7 @@ MAX_OPEN_EXPOSURE = 5000.0
 DAILY_LOSS_CAP = 2500.0
 MAX_ENTRY_SLIPPAGE = 0.10
 MAX_QUOTE_AGE_SECONDS = 30
-TRADERS = {'cassytrades': '0DTE', 'clintoptions': None, 'capricekayem': None}
+TRADERS = {'cassytrades': '0DTE', 'clintoptions': None, 'capricekayem': None, 'spylieu': None}
 MARKET_HOLIDAYS = {
     '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25', '2026-06-19',
     '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25', '2027-01-01', '2027-01-18',
@@ -70,11 +70,26 @@ class Policy:
             raise ValueError('slippage must not exceed reviewed limit')
 
 
+def _load_source_key():
+    """Authenticated producer key. Lives outside the repo, 0600. Missing in
+    live mode fails closed at admission ('verified_source_channel_required')."""
+    path = os.environ.get("COPYTRADER_SOURCE_KEY_FILE",
+                          os.path.expanduser("~/.local/share/copypasta/source_key"))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        key = bytes.fromhex(raw)
+    except (OSError, ValueError):
+        return None
+    return key if len(key) >= 32 else None
+
+
 def load_policy():
     path = os.environ.get('COPYTRADER_CONFIG')
+    source_key = _load_source_key()
     if not path:
-        return Policy()
+        return Policy(source_key=source_key)
     data = json.loads(Path(path).read_text())
     if not isinstance(data, dict) or set(data) - {'sources', 'max_age_seconds', 'trade_target', 'max_exposure', 'daily_loss_cap', 'max_slippage'}:
         raise ValueError('unsupported policy keys')
-    return Policy(**data)
+    return Policy(source_key=source_key, **data)

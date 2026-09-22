@@ -70,6 +70,7 @@ class ResolvedContract:
     strike: float
     option_type: str         # "call" | "put"
     contract_symbol: str     # OCC symbol, e.g. "SPY   260923P00759000"
+    option_id: str           # broker instrument UUID (single source of contract identity)
     premium: float | None    # trader's disclosed entry premium (None if undisclosed)
     inferred_expiry: bool    # True if expiry came from trader default, not post text
 
@@ -318,8 +319,11 @@ def resolve(post_text: str, handle: str, posted_at_iso: str, mcp, *,
     exact = [c for c in results if identity_matches(c)]
     if len(exact) != 1:
         return Ambiguous("contract lookup did not return exactly one verified OCC identity", [])
+    option_id = exact[0].get("option_id")
+    if type(option_id) is not str or not option_id:
+        return Ambiguous("contract lookup did not return exactly one verified OCC identity", [])
     return ResolvedContract(
         underlying=underlying, expiry=expiry, strike=strike,
         option_type=option_type, contract_symbol=expected_symbol,
-        premium=premium, inferred_expiry=inferred_expiry,
+        option_id=option_id, premium=premium, inferred_expiry=inferred_expiry,
     )

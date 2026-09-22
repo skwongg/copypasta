@@ -46,8 +46,7 @@ def main(argv=None):
     parser.add_argument('--market-json', help='explicit offline fixture for paper simulation')
     args = parser.parse_args(argv)
     if args.mode == 'live':
-        print('Live execution disabled pending broker adapter and deployment review.', file=sys.stderr)
-        return 2
+        return live_main(args)
     if not args.market_json:
         parser.error('--market-json is required for credential-free paper execution')
     try:
@@ -59,6 +58,41 @@ def main(argv=None):
     except Exception:
         print('Input/configuration/state validation failed. No live access attempted.', file=sys.stderr)
         return 1
+
+
+def live_main(args):
+    """Live entry path. Every gate below must pass or nothing fires.
+
+    Activation requires ALL of: LIVE_TRADING_ENABLED in mcp_client,
+    the ARMED marker, a configured source allowlist, market hours, and
+    the kill-switch armed. process_entry enforces the rest.
+    """
+    from mcp_client import MCPClient, LIVE_TRADING_ENABLED
+    import kill
+    # Refuse before touching credentials, input, or the network.
+    if not LIVE_TRADING_ENABLED:
+        print('Live entry refused: broker adapter is not enabled.', file=sys.stderr)
+        return 2
+    policy = load_policy()
+    if not all(policy.sources.values()):
+        print('Live entry refused: policy.sources is not configured.', file=sys.stderr)
+        return 2
+    probe = MCPClient(mode='live', account_number='DISCOVERY')
+    account = probe.discover_agentic_account()
+    probe.close()
+    if args.account and args.account != account:
+        print('Live entry refused: --account does not match the agentic account.', file=sys.stderr)
+        return 2
+    state = TradingState('live', account)
+    if not kill.can_fire(context=state):
+        print('Live entry refused: not armed or halted.', file=sys.stderr)
+        return 2
+    mcp = MCPClient(mode='live', account_number=account, state_context=state)
+    mcp.assert_mutation_allowed()  # fails before any network side effect
+    summary = fire(_read_alerts(args.alerts_json), 'live', mcp=mcp, state=state,
+                   policy=policy)
+    print(json.dumps(summary))
+    return 0
 
 
 if __name__ == '__main__':

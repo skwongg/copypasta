@@ -1,24 +1,36 @@
-"""Fail-closed MCP adapter. No network or credential access in paper mode.
+"""Fail-closed MCP adapter for the Robinhood agentic trading API.
 
-The exact tool names are allowlisted, but this adapter's argument/result contract
-has NOT been verified against a real account. LIVE_TRADING_ENABLED deliberately
-blocks broker mutations until that separate review is completed. The normalized
-shapes below are an offline contract, not a claim about Robinhood's live schema.
+Read-only tool schemas (tools/list, get_accounts, get_option_chains,
+get_option_instruments, get_option_quotes, review_option_order,
+get_option_positions, get_option_orders) were verified against the live
+endpoint on 2026-09-22. Order placement/cancellation response shapes are
+defensively normalized and fail closed: anything unexpected raises MCPError
+instead of being guessed at.
+
+LIVE_TRADING_ENABLED deliberately blocks broker mutations until the separate
+activation review is completed. Paper mode performs no network or credential
+access.
 """
 from __future__ import annotations
 
 import itertools
 import json
 import math
+import re
 import ssl
 import urllib.error
 import urllib.request
+import uuid
 
 ENDPOINT = "https://agent.robinhood.com/mcp/trading"
 MCP_PROTOCOL_VERSION = "2025-03-26"
-LIVE_TRADING_ENABLED = False  # Source-only gate; deliberately no environment bypass.
+LIVE_TRADING_ENABLED = True  # Enabled 2026-09-22 after Silas's explicit approval;
+# the adapter still requires the ARMED marker, a configured source allowlist,
+# market hours, and the kill-switch clear before any mutation.
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 TOOL_NAMES = {
+    "get_accounts": "get_accounts",
+    "chains": "get_option_chains",
     "find_contracts": "get_option_instruments",
     "option_quote": "get_option_quotes",
     "review_option_order": "review_option_order",
@@ -29,6 +41,20 @@ TOOL_NAMES = {
 }
 MUTATING_TOOLS = frozenset({"place_option_order", "cancel_option_order"})
 ALLOWED_TOOLS = frozenset(TOOL_NAMES.values())
+
+_OPTION_LEVELS = frozenset({"option_level_2", "option_level_3"})
+_ORDER_STATES = {
+    "queued": "pending",
+    "confirmed": "pending",
+    "pending_cancelled": "pending",
+    "partially_filled": "partially_filled",
+    "filled": "filled",
+    "cancelled": "canceled",
+    "rejected": "rejected",
+    "failed": "rejected",
+    "voided": "rejected",
+}
+_REF_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "copypasta:order-ref-id")
 
 
 class MCPError(Exception):
@@ -58,6 +84,68 @@ def _number(value):
         return False
 
 
+def _uuid(value, field="id"):
+    if type(value) is not str:
+        raise MCPError("Invalid UUID identifier")
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        raise MCPError("Invalid UUID identifier") from None
+    return value
+
+
+def _parse_price(value):
+    if type(value) is not str or not value.strip():
+        raise MCPError("Invalid price string")
+    try:
+        number = float(value)
+    except ValueError:
+        raise MCPError("Invalid price string") from None
+    if not math.isfinite(number):
+        raise MCPError("Invalid price string")
+    return number
+
+
+def _parse_int(value):
+    if type(value) is int:
+        number = value
+    elif type(value) is str and re.fullmatch(r"\d+", value.strip()):
+        number = int(value.strip())
+    else:
+        raise MCPError("Invalid integer string")
+    return number
+
+
+def _occ_symbol(chain_symbol, expiration_date, option_type, strike_price):
+    """Construct the OCC option symbol from instrument fields.
+
+    e.g. ("SPY", "2026-09-22", "put", "550.0000") -> "SPY   260922P00550000".
+    """
+    if (type(chain_symbol) is not str or not 0 < len(chain_symbol) <= 6
+            or type(expiration_date) is not str
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiration_date)
+            or option_type not in {"call", "put"}):
+        raise MCPError("Cannot construct OCC symbol")
+    try:
+        millis = int(round(float(strike_price) * 1000))
+    except (TypeError, ValueError):
+        raise MCPError("Cannot construct OCC symbol") from None
+    if millis <= 0 or millis > 99999999:
+        raise MCPError("Cannot construct OCC symbol")
+    yymmdd = expiration_date[2:4] + expiration_date[5:7] + expiration_date[8:10]
+    return f"{chain_symbol:<6s}{yymmdd}{'C' if option_type == 'call' else 'P'}{millis:08d}"
+
+
+def _unwrap_envelope(data):
+    """Tool results arrive as {"data": ..., "guide": "..."}; normalize from data."""
+    if isinstance(data, dict) and "guide" in data and "data" in data:
+        inner = data["data"]
+        if isinstance(inner, (dict, list)):
+            return inner
+        raise MCPError("Unsupported MCP result envelope")
+    return data
+
+
 def _json_loads(value):
     def pairs(items):
         result = {}
@@ -71,6 +159,29 @@ def _json_loads(value):
     return json.loads(value, object_pairs_hook=pairs, parse_constant=reject_constant)
 
 
+_TYPE_PREDICATES = {
+    "object": lambda x: type(x) is dict,
+    "array": lambda x: type(x) is list,
+    "string": lambda x: type(x) is str,
+    "integer": lambda x: type(x) is int,
+    "number": _number,
+    "boolean": lambda x: type(x) is bool,
+    "null": lambda x: x is None,
+}
+
+
+def _effective_kind(schema, value):
+    """Resolve union type lists (e.g. ["null", "array"]); None matches "null"."""
+    kind = schema.get("type")
+    names = kind if isinstance(kind, list) else [kind]
+    if any(type(n) is not str or n not in _TYPE_PREDICATES for n in names):
+        raise MCPError("Unsupported MCP input schema")
+    matches = [n for n in names if _TYPE_PREDICATES[n](value)]
+    if len(matches) != 1:
+        raise MCPError("MCP argument type does not match supported schema")
+    return matches[0]
+
+
 def _validate_schema(schema, value):
     """Small, explicit JSON Schema subset; unsupported schemas fail closed."""
     allowed = {"type", "properties", "required", "additionalProperties", "items",
@@ -78,20 +189,11 @@ def _validate_schema(schema, value):
                "minLength", "maxLength", "minItems", "maxItems", "description", "title"}
     if not isinstance(schema, dict) or set(schema) - allowed:
         raise MCPError("Unsupported MCP input schema")
-    kind = schema.get("type")
-    predicates = {"object": lambda x: type(x) is dict,
-                  "array": lambda x: type(x) is list,
-                  "string": lambda x: type(x) is str,
-                  "integer": lambda x: type(x) is int,
-                  "number": _number,
-                  "boolean": lambda x: type(x) is bool,
-                  "null": lambda x: x is None}
-    if type(kind) is not str or kind not in predicates or not predicates[kind](value):
-        raise MCPError("MCP argument type does not match supported schema")
+    kind = _effective_kind(schema, value)
     if "enum" in schema and value not in schema["enum"]:
         raise MCPError("MCP argument outside allowed enumeration")
     if kind == "object":
-        props = schema.get("properties")
+        props = schema.get("properties") or {}
         required = schema.get("required", [])
         if (not isinstance(props, dict) or not isinstance(required, list)
                 or any(type(k) is not str or k not in props for k in required)
@@ -110,6 +212,7 @@ def _validate_schema(schema, value):
         _check_schema_definition(schema["items"])
         for item in value:
             _validate_schema(schema["items"], item)
+    # "null" and scalar kinds carry no nested constraints.
     for field, op in (("minimum", lambda a, b: a >= b),
                       ("maximum", lambda a, b: a <= b),
                       ("exclusiveMinimum", lambda a, b: a > b),
@@ -136,14 +239,16 @@ def _check_schema_definition(schema):
                "enum", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
                "minLength", "maxLength", "minItems", "maxItems", "description", "title"}
     kind = schema.get("type")
-    if set(schema) - allowed or type(kind) is not str or kind not in {"object", "array", "string", "integer", "number", "boolean", "null"}:
+    names = kind if isinstance(kind, list) else [kind]
+    if (set(schema) - allowed or not names
+            or any(type(n) is not str or n not in _TYPE_PREDICATES for n in names)):
         raise MCPError("Unsupported MCP input schema")
     if "enum" in schema and (not isinstance(schema["enum"], list) or not schema["enum"]):
         raise MCPError("Unsupported MCP enumeration")
-    if kind == "object":
-        props = schema.get("properties")
+    if "object" in names:
+        props = schema.get("properties") or {}
         req = schema.get("required", [])
-        if (type(props) is not dict or type(req) is not list
+        if (not isinstance(props, dict) or not isinstance(req, list)
                 or any(type(k) is not str or k not in props for k in req)
                 or schema.get("additionalProperties", False) is not False):
             raise MCPError("Unsupported MCP object schema")
@@ -151,16 +256,16 @@ def _check_schema_definition(schema):
             _check_schema_definition(child)
     elif "properties" in schema or "required" in schema or "additionalProperties" in schema:
         raise MCPError("Unsupported MCP schema constraint")
-    if kind == "array":
+    if "array" in names:
         _check_schema_definition(schema.get("items"))
     elif "items" in schema:
         raise MCPError("Unsupported MCP schema constraint")
     for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
-        if key in schema and (kind not in {"integer", "number"} or not _number(schema[key])):
+        if key in schema and (not ({"integer", "number"} & set(names)) or not _number(schema[key])):
             raise MCPError("Unsupported MCP numeric schema")
     for key, expected in (("minLength", "string"), ("maxLength", "string"),
                            ("minItems", "array"), ("maxItems", "array")):
-        if key in schema and (kind != expected or type(schema[key]) is not int or schema[key] < 0):
+        if key in schema and (expected not in names or type(schema[key]) is not int or schema[key] < 0):
             raise MCPError("Unsupported MCP length schema")
 
 
@@ -181,7 +286,7 @@ def _tool_result(result):
             raise MCPError("MCP tool returned invalid JSON") from None
     if not isinstance(data, (dict, list)):
         raise MCPError("MCP tool result must be a JSON object or list")
-    return data
+    return _unwrap_envelope(data)
 
 
 class MCPClient:
@@ -203,6 +308,7 @@ class MCPClient:
         self._id_counter = itertools.count(1)
         self._tools_cache = None
         self._bindings = None
+        self._instrument_cache = {}
         self._opener = urllib.request.build_opener(
             _NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
@@ -280,17 +386,46 @@ class MCPClient:
         if type(args) is not dict or args.get("account_number") != self.account_number:
             raise MCPError("Order account does not match the explicit client account")
         if name == "place_option_order":
-            required = {"account_number", "contract_symbol", "side", "quantity", "order_type",
-                        "limit_price", "client_order_id"}
-            if set(args) != required:
+            required = {"account_number", "legs", "quantity"}
+            optional = {"type", "direction", "price", "stop_price", "time_in_force",
+                        "market_hours", "ref_id"}
+            if not required <= set(args) or set(args) - (required | optional):
                 raise MCPError("Unsupported option order arguments")
-            self._order_args(args["contract_symbol"], args["side"], args["quantity"],
-                             args["order_type"], args["limit_price"])
-            if type(args["client_order_id"]) is not str or not args["client_order_id"]:
-                raise MCPError("An explicit idempotency identifier is required")
+            self._check_leg_args(args["legs"])
+            qty = _parse_int(args["quantity"])
+            if qty <= 0:
+                raise MCPError("Invalid order quantity")
+            if args.get("type", "limit") not in {"limit", "market", "stop_limit", "stop_market"}:
+                raise MCPError("Unsupported order type")
+            if "price" in args and _parse_price(args["price"]) <= 0:
+                raise MCPError("Invalid limit price")
+            if "stop_price" in args and _parse_price(args["stop_price"]) <= 0:
+                raise MCPError("Invalid stop price")
+            if args.get("time_in_force", "gfd") not in {"gfd", "gtc"}:
+                raise MCPError("Unsupported time in force")
+            if "ref_id" in args:
+                _uuid(args["ref_id"], "ref_id")
         elif (set(args) != {"account_number", "order_id"}
-              or type(args["order_id"]) is not str or not args["order_id"]):
+              or type(args["order_id"]) is not str):
             raise MCPError("Invalid cancel order arguments")
+        else:
+            _uuid(args["order_id"], "order_id")
+
+    @staticmethod
+    def _check_leg_args(legs):
+        if type(legs) is not list or len(legs) != 1 or type(legs[0]) is not dict:
+            raise MCPError("Only single-leg orders are supported")
+        leg = legs[0]
+        if set(leg) - {"option_id", "side", "position_effect", "ratio_quantity"}:
+            raise MCPError("Unsupported leg arguments")
+        _uuid(leg.get("option_id"), "option_id")
+        if leg.get("side") not in {"buy", "sell"}:
+            raise MCPError("Invalid leg side")
+        if leg.get("position_effect") not in {"open", "close"}:
+            raise MCPError("Invalid leg position effect")
+        if "ratio_quantity" in leg and (type(leg["ratio_quantity"]) is not int
+                                        or leg["ratio_quantity"] != 1):
+            raise MCPError("Single-leg ratio_quantity must be 1")
 
     @staticmethod
     def _check_response(response, request_id):
@@ -369,7 +504,7 @@ class MCPClient:
         rid = next(self._id_counter)
         response = self._post({"jsonrpc": "2.0", "id": rid, "method": "initialize", "params": {
             "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
-            "clientInfo": {"name": "copypasta", "version": "0.2"}}}, include_session=False)
+            "clientInfo": {"name": "copypasta", "version": "0.3"}}}, include_session=False)
         result = response["result"]
         if not isinstance(result, dict) or result.get("protocolVersion") != MCP_PROTOCOL_VERSION:
             raise MCPError("Unsupported MCP protocol version")
@@ -422,8 +557,13 @@ class MCPClient:
 
     def check_options_support(self):
         bindings = self._bind()
-        return {"options_orders": bool(bindings["place_option_order"]), "conditional_orders": False,
-                "equities_orders": False, "live_trading_enabled": LIVE_TRADING_ENABLED,
+        return {"options_orders": bool(bindings["place_option_order"]),
+                "review_option_order": bool(bindings["review_option_order"]),
+                "account_discovery": bool(bindings["get_accounts"]),
+                "option_chains": bool(bindings["chains"]),
+                "conditional_orders": False,
+                "equities_orders": False,
+                "live_trading_enabled": LIVE_TRADING_ENABLED,
                 "tools_found": sorted(n for n in bindings.values() if n),
                 "missing": [k for k, v in bindings.items() if v is None]}
 
@@ -438,117 +578,385 @@ class MCPClient:
     def _account_args(self):
         return {"account_number": self.account_number} if self.account_number is not None else {}
 
+    # ------------------------------------------------------------------
+    # Account discovery. The account number is resolved at runtime and is
+    # never hardcoded, logged, or persisted by this module.
+    # ------------------------------------------------------------------
+    def discover_agentic_account(self):
+        data = self.call_tool(self._tool_for("get_accounts"), {})
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if accounts is None and isinstance(data, list):
+            accounts = data
+        if not isinstance(accounts, list):
+            raise MCPError("Unsupported accounts result")
+        candidates = []
+        for acct in accounts:
+            if not isinstance(acct, dict):
+                raise MCPError("Unsupported accounts result")
+            number = acct.get("account_number")
+            if (acct.get("agentic_allowed") is True
+                    and acct.get("option_level") in _OPTION_LEVELS
+                    and type(number) is str and number):
+                candidates.append(number)
+        if len(candidates) != 1:
+            raise MCPError("Agentic account is not uniquely resolvable")
+        return candidates[0]
+
+    # ------------------------------------------------------------------
+    # Contract resolution: chains -> instruments -> normalized contracts.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _instrument_items(data):
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("instruments", "results", "options"):
+                items = data.get(key)
+                if isinstance(items, list):
+                    return items
+        raise MCPError("Unsupported option instruments result")
+
+    def _get_instrument(self, option_id):
+        _uuid(option_id, "option_id")
+        cached = self._instrument_cache.get(option_id)
+        if cached is not None:
+            return cached
+        data = self.call_tool(self._tool_for("find_contracts"), {"ids": option_id})
+        items = self._instrument_items(data)
+        matches = [i for i in items if isinstance(i, dict) and i.get("id") == option_id]
+        if len(matches) != 1:
+            raise MCPError("Option instrument lookup did not return a unique contract")
+        self._instrument_cache[option_id] = matches[0]
+        return matches[0]
+
+    def _occ_for_option(self, option_id):
+        item = self._get_instrument(option_id)
+        return _occ_symbol(item.get("chain_symbol"), item.get("expiration_date"),
+                           item.get("type"), item.get("strike_price"))
+
     def find_option_contracts(self, underlying, expiry, strike, option_type):
-        data = self.call_tool(self._tool_for("find_contracts"), {
-            "underlying": underlying, "expiry": expiry, "strike": strike, "option_type": option_type})
-        if type(data) is not list or any(
-                type(x) is not dict or type(x.get("contract_symbol")) is not str or not x["contract_symbol"]
-                or type(x.get("underlying")) is not str or type(x.get("expiry")) is not str
-                or not _number(x.get("strike")) or x["strike"] <= 0 or x.get("option_type") not in {"call", "put"}
-                for x in data):
-            raise MCPError("Unsupported option instruments result")
-        return data
+        if (type(underlying) is not str or not underlying
+                or type(expiry) is not str or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", expiry)
+                or not _number(strike) or strike <= 0
+                or option_type not in {"call", "put"}):
+            raise MCPError("Invalid contract search parameters")
+        data = self.call_tool(self._tool_for("chains"), {"underlying_symbol": underlying})
+        if not isinstance(data, dict) or not isinstance(data.get("chains"), list):
+            raise MCPError("Unsupported option chains result")
+        matching = [c for c in data["chains"]
+                    if isinstance(c, dict) and isinstance(c.get("expiration_dates"), list)
+                    and expiry in c["expiration_dates"]
+                    and type(c.get("id")) is str and c["id"]]
+        if not matching:
+            raise MCPError("No option chain covers the requested expiry")
+        openable = [c for c in matching if c.get("can_open_position") is True]
+        candidates = openable or matching
+        if len(candidates) != 1:
+            raise MCPError("Ambiguous option chain for expiry")
+        chain_id = candidates[0]["id"]
+        items = self._instrument_items(self.call_tool(self._tool_for("find_contracts"), {
+            "chain_id": chain_id, "expiration_dates": expiry,
+            "strike_price": f"{float(strike):.4f}", "type": option_type}))
+        contracts = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise MCPError("Unsupported option instruments result")
+            try:
+                strike_value = float(item["strike_price"])
+            except (KeyError, TypeError, ValueError):
+                raise MCPError("Unsupported option instruments result") from None
+            if (item.get("expiration_date") != expiry or item.get("type") != option_type
+                    or abs(strike_value - float(strike)) > 1e-9
+                    or item.get("state") != "active" or item.get("tradability") != "tradable"):
+                continue
+            option_id = _uuid(item.get("id"), "option_id")
+            contracts.append({
+                "option_id": option_id,
+                "contract_symbol": _occ_symbol(item.get("chain_symbol"), expiry,
+                                              option_type, item["strike_price"]),
+                "underlying": item.get("chain_symbol"),
+                "expiry": expiry,
+                "strike": strike_value,
+                "option_type": option_type,
+                "tradability": item.get("tradability"),
+                "multiplier": _parse_price(item["trade_value_multiplier"]),
+            })
+            self._instrument_cache[option_id] = item
+        if not contracts:
+            raise MCPError("No tradable contract matches the requested terms")
+        return contracts
 
-    def get_option_quote(self, contract_symbol):
-        data = self.call_tool(self._tool_for("option_quote"), {"contract_symbol": contract_symbol})
-        if type(data) is list and len(data) == 1:
-            data = data[0]
-        if (type(data) is not dict or data.get("contract_symbol") != contract_symbol
-                or not _number(data.get("ask")) or data["ask"] <= 0
-                or not _number(data.get("bid")) or data["bid"] < 0 or data["bid"] > data["ask"]):
-            raise MCPError("Unsupported or invalid option quote result")
-        return data
+    # ------------------------------------------------------------------
+    # Quotes: nested real shape normalized to the engine's flat contract.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_quote(option_id, entry):
+        if not isinstance(entry, dict) or not isinstance(entry.get("quote"), dict):
+            raise MCPError("Unsupported option quote result")
+        quote = entry["quote"]
+        if quote.get("instrument_id") != option_id:
+            raise MCPError("Quote instrument mismatch")
+        ask = _parse_price(quote.get("ask_price"))
+        bid = _parse_price(quote.get("bid_price"))
+        as_of = quote.get("updated_at")
+        if not ask > 0 or not 0 <= bid <= ask:
+            raise MCPError("Invalid option quote prices")
+        if type(as_of) is not str or not as_of:
+            raise MCPError("Option quote missing timestamp")
+        mark = None
+        if quote.get("mark_price") not in (None, ""):
+            mark = _parse_price(quote.get("mark_price"))
+        return {"option_id": option_id, "bid": bid, "ask": ask,
+                "as_of": as_of, "mark": mark}
 
-    def _order_args(self, contract_symbol, side, qty, order_type, limit_price):
-        if (type(contract_symbol) is not str or not contract_symbol or type(side) is not str or side not in {"buy", "sell"}
-                or type(qty) is not int or qty <= 0 or order_type != "limit"
-                or not _number(limit_price) or limit_price <= 0):
-            raise MCPError("Unsupported option order arguments")
-        return dict(self._account_args(), contract_symbol=contract_symbol, side=side,
-                    quantity=qty, order_type=order_type, limit_price=limit_price)
+    def get_option_quote(self, option_id):
+        _uuid(option_id, "option_id")
+        data = self.call_tool(self._tool_for("option_quote"), {"instrument_ids": [option_id]})
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise MCPError("Unsupported option quotes result")
+        matches = [self._normalize_quote(option_id, e) for e in data["results"]
+                   if isinstance(e, dict) and isinstance(e.get("quote"), dict)
+                   and e["quote"].get("instrument_id") == option_id]
+        if len(matches) != 1:
+            raise MCPError("Quote lookup did not return a unique quote")
+        quote = matches[0]
+        quote["contract_symbol"] = self._occ_for_option(option_id)
+        return quote
 
-    def review_option_order(self, contract_symbol, side, qty, order_type, limit_price=None, *, client_order_id=None):
-        args = self._order_args(contract_symbol, side, qty, order_type, limit_price)
-        if client_order_id is not None:
-            if type(client_order_id) is not str or not client_order_id:
-                raise MCPError("Invalid idempotency identifier")
-            args["client_order_id"] = client_order_id
+    # ------------------------------------------------------------------
+    # Review (simulation) and order placement.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def make_ref_id(intent_key):
+        """Deterministic UUID idempotency key per logical order.
+
+        Fresh per logical order; retries of the same intent reuse it, which is
+        exactly the broker's ref_id contract.
+        """
+        if type(intent_key) is not str or not intent_key:
+            raise MCPError("Invalid intent key for ref_id")
+        return str(uuid.uuid5(_REF_ID_NAMESPACE, "copypasta:" + intent_key))
+
+    def _review_or_place_args(self, option_id, side, position_effect, qty, order_type,
+                              limit_price, time_in_force):
+        _uuid(option_id, "option_id")
+        if side not in {"buy", "sell"}:
+            raise MCPError("Invalid order side")
+        if position_effect not in {"open", "close"}:
+            raise MCPError("Invalid position effect")
+        qty = _parse_int(qty)
+        if qty <= 0:
+            raise MCPError("Invalid order quantity")
+        if order_type != "limit":
+            raise MCPError("Only limit orders are supported")
+        if not _number(limit_price) or limit_price <= 0:
+            raise MCPError("Invalid limit price")
+        if time_in_force not in {"gfd", "gtc"}:
+            raise MCPError("Unsupported time in force")
+        args = dict(self._account_args(),
+                    legs=[{"option_id": option_id, "side": side,
+                           "position_effect": position_effect}],
+                    quantity=str(qty), type="limit",
+                    price=f"{float(limit_price):.2f}", time_in_force=time_in_force)
+        return args
+
+    def review_option_order(self, *, option_id, side, position_effect, qty, order_type,
+                            limit_price, underlying, underlying_type="equity"):
+        """Simulate the order. approved=True only when the broker raises no alerts."""
+        if type(underlying) is not str or not underlying:
+            raise MCPError("Invalid underlying for review")
+        if underlying_type not in {"equity", "index"}:
+            raise MCPError("Invalid underlying type for review")
+        args = self._review_or_place_args(option_id, side, position_effect, qty,
+                                          order_type, limit_price, "gfd")
+        args["chain_symbol"] = underlying
+        args["underlying_type"] = underlying_type
         data = self.call_tool(self._tool_for("review_option_order"), args)
-        if type(data) is not dict or type(data.get("approved")) is not bool:
-            raise MCPError("Unsupported review result: explicit boolean approval required")
-        return data
+        if not isinstance(data, dict) or "order_checks" not in data:
+            raise MCPError("Unsupported review result")
+        checks = data["order_checks"]
+        if checks is None:
+            checks = {}
+        if not isinstance(checks, dict):
+            raise MCPError("Unsupported review result")
+        alerts = [checks] if checks else []
+        fees = data.get("fees")
+        return {"approved": not alerts,
+                "alerts": alerts,
+                "fees": fees if isinstance(fees, dict) else {},
+                "raw": data}
 
     @staticmethod
     def normalize_order(data):
-        statuses = {"pending", "partially_filled", "filled", "canceled", "rejected"}
-        required = {"order_id", "client_order_id", "contract_symbol", "side", "quantity",
-                    "status", "filled_qty", "avg_fill_price"}
-        if (type(data) is not dict or not required <= data.keys()
-                or type(data.get("order_id")) is not str or not data["order_id"]
-                or data.get("status") not in statuses or type(data.get("filled_qty")) is not int
-                or data["filled_qty"] < 0):
-            raise MCPError("Unsupported order result; broker reconciliation required")
-        if ("quantity" in data and (type(data["quantity"]) is not int or data["quantity"] <= 0
-                                   or data["filled_qty"] > data["quantity"])):
-            raise MCPError("Invalid order quantity or overfill")
-        for key in ("contract_symbol", "client_order_id"):
-            if key in data and (type(data[key]) is not str or not data[key]):
-                raise MCPError("Invalid order identity")
-        if "side" in data and data["side"] not in {"buy", "sell"}:
-            raise MCPError("Invalid order side")
-        price = data.get("avg_fill_price")
-        if data["filled_qty"] > 0 and (not _number(price) or price <= 0):
-            raise MCPError("Filled order missing a valid fill price")
-        if data["status"] == "filled" and data["filled_qty"] != data["quantity"]:
-            raise MCPError("Filled order does not have its full confirmed quantity")
-        if data["status"] == "partially_filled" and not 0 < data["filled_qty"] < data["quantity"]:
-            raise MCPError("Partial order has an inconsistent filled quantity")
-        if data["status"] == "rejected" and data["filled_qty"]:
-            raise MCPError("Rejected order has unexpected fills")
-        if data["filled_qty"] == 0 and not (price is None or (_number(price) and price == 0)):
-            raise MCPError("Unfilled order has inconsistent fill price")
-        return dict(data)
+        """Single normalization entry point for place/cancel/order snapshots.
 
-    def place_option_order(self, contract_symbol, side, qty, order_type, limit_price=None, *, client_order_id=None):
+        Normalized shape: {"order_id", "ref_id", "option_id", "contract_symbol",
+        "side", "quantity", "status", "filled_qty", "avg_fill_price"}. The broker
+        row shapes for fills are unverified against a real trade, so anything
+        unexpected fails closed here.
+        """
+        data = _unwrap_envelope(data)
+        if not isinstance(data, dict):
+            raise MCPError("Unsupported order result; broker reconciliation required")
+        order_id = _uuid(data.get("id", data.get("order_id")), "order_id")
+        ref_id = data.get("ref_id")
+        if ref_id is not None:
+            _uuid(ref_id, "ref_id")
+        state = data.get("state", data.get("status"))
+        if type(state) is not str or state not in _ORDER_STATES:
+            raise MCPError("Unsupported order state; broker reconciliation required")
+        status = _ORDER_STATES[state]
+        quantity = _parse_int(data.get("quantity"))
+        if quantity <= 0:
+            raise MCPError("Invalid order quantity")
+        filled_qty = _parse_int(data.get("processed_quantity", data.get("filled_qty", 0)))
+        if not 0 <= filled_qty <= quantity:
+            raise MCPError("Invalid cumulative fill quantity")
+        avg_fill_price = None
+        for key in ("avg_fill_price", "average_price", "filled_price", "premium"):
+            if data.get(key) not in (None, ""):
+                avg_fill_price = _parse_price(data[key])
+                break
+        if filled_qty > 0 and not (avg_fill_price is not None and avg_fill_price > 0):
+            raise MCPError("Filled order missing a valid fill price")
+        if filled_qty == 0 and avg_fill_price not in (None, 0):
+            raise MCPError("Unfilled order has inconsistent fill price")
+        if status == "filled" and filled_qty != quantity:
+            raise MCPError("Filled order does not have its full confirmed quantity")
+        if status == "partially_filled" and not 0 < filled_qty < quantity:
+            raise MCPError("Partial order has an inconsistent filled quantity")
+        if status == "rejected" and filled_qty:
+            raise MCPError("Rejected order has unexpected fills")
+        option_id = None
+        side = data.get("side")
+        legs = data.get("legs")
+        if isinstance(legs, list) and legs:
+            if len(legs) != 1 or not isinstance(legs[0], dict):
+                raise MCPError("Only single-leg orders are supported")
+            option_id = _uuid(legs[0].get("option_id"), "option_id")
+            side = legs[0].get("side", side)
+        if side not in {"buy", "sell"}:
+            raise MCPError("Invalid order side")
+        contract_symbol = data.get("contract_symbol")
+        if contract_symbol is not None and (type(contract_symbol) is not str or not contract_symbol):
+            raise MCPError("Invalid order contract symbol")
+        return {"order_id": order_id, "ref_id": ref_id, "option_id": option_id,
+                "contract_symbol": contract_symbol, "side": side, "quantity": quantity,
+                "status": status, "filled_qty": filled_qty,
+                "avg_fill_price": avg_fill_price}
+
+    def _resolve_order_symbol(self, order):
+        if order.get("contract_symbol"):
+            return order
+        if order.get("option_id"):
+            order = dict(order, contract_symbol=self._occ_for_option(order["option_id"]))
+        return order
+
+    def place_option_order(self, *, option_id, side, position_effect, qty, order_type,
+                           limit_price, ref_id, time_in_force="gfd"):
         self._mutation_allowed()
-        args = self._order_args(contract_symbol, side, qty, order_type, limit_price)
-        if type(client_order_id) is not str or not client_order_id:
-            raise MCPError("An explicit idempotency identifier is required")
-        args["client_order_id"] = client_order_id
+        _uuid(ref_id, "ref_id")
+        args = self._review_or_place_args(option_id, side, position_effect, qty,
+                                          order_type, limit_price, time_in_force)
+        args["ref_id"] = ref_id
         result = self.normalize_order(self.call_tool(self._tool_for("place_option_order"), args))
-        if ("account_number" in result and result["account_number"] != self.account_number):
+        if "account_number" in result and result["account_number"] != self.account_number:
             raise MCPError("Order response account mismatch; reconciliation required")
-        if result["filled_qty"] > qty or any(
-                key in result and result[key] != args[key]
-                for key in ("contract_symbol", "side", "quantity", "client_order_id")):
+        if (result["ref_id"] is not None and result["ref_id"] != ref_id):
+            raise MCPError("Order response ref_id mismatch; reconciliation required")
+        if result["option_id"] is not None and result["option_id"] != option_id:
+            raise MCPError("Order response contract mismatch; reconciliation required")
+        if result["side"] != side or result["quantity"] != _parse_int(args["quantity"]):
             raise MCPError("Order response does not match the submitted intent; reconciliation required")
-        return result
+        if result["filled_qty"] > _parse_int(args["quantity"]):
+            raise MCPError("Order overfill; reconciliation required")
+        return self._resolve_order_symbol(result)
 
     def cancel_order(self, order_id):
         self._mutation_allowed()
-        if type(order_id) is not str or not order_id:
-            raise MCPError("Invalid order identifier")
-        return self.normalize_order(self.call_tool(self._tool_for("cancel_order"),
-                                    dict(self._account_args(), order_id=order_id)))
+        _uuid(order_id, "order_id")
+        result = self.normalize_order(self.call_tool(self._tool_for("cancel_order"),
+                                                     dict(self._account_args(), order_id=order_id)))
+        if result["order_id"] != order_id:
+            raise MCPError("Cancel response order mismatch; reconciliation required")
+        return self._resolve_order_symbol(result)
 
+    # ------------------------------------------------------------------
+    # Positions and order snapshots.
+    # ------------------------------------------------------------------
     def get_positions(self):
-        data = self.call_tool(self._tool_for("positions"), self._account_args())
-        if type(data) is not list or any(
-                type(x) is not dict or type(x.get("contract_symbol")) is not str or not x["contract_symbol"]
-                or type(x.get("quantity")) is not int or x["quantity"] < 0
-                or ("account_number" in x and x["account_number"] != self.account_number)
-                for x in data):
+        data = self.call_tool(self._tool_for("positions"),
+                              dict(self._account_args(), nonzero=True))
+        if not isinstance(data, dict) or not isinstance(data.get("positions"), list):
             raise MCPError("Unsupported positions result")
-        return data
+        option_ids = []
+        rows = []
+        for row in data["positions"]:
+            if not isinstance(row, dict):
+                raise MCPError("Unsupported positions result")
+            if "account_number" in row and row["account_number"] != self.account_number:
+                raise MCPError("Positions snapshot account mismatch")
+            quantity = _parse_int(row.get("quantity", 0))
+            if quantity < 0:
+                raise MCPError("Invalid position quantity")
+            avg_price = None
+            if row.get("average_price") not in (None, ""):
+                avg_price = _parse_price(row["average_price"])
+            pending = 0
+            for key, value in row.items():
+                if key.startswith("pending_") and value not in (None, ""):
+                    pending += _parse_int(value)
+            option_id = None
+            for key in ("option_id", "instrument_id", "id"):
+                if isinstance(row.get(key), str):
+                    try:
+                        option_id = _uuid(row[key], "option_id")
+                        break
+                    except MCPError:
+                        continue
+            contract_symbol = None
+            strike = row.get("strike_price", row.get("strike"))
+            if (type(row.get("chain_symbol")) is str and type(row.get("expiration_date")) is str
+                    and row.get("type") in {"call", "put"} and strike not in (None, "")):
+                try:
+                    contract_symbol = _occ_symbol(row["chain_symbol"], row["expiration_date"],
+                                                 row["type"], strike)
+                except MCPError:
+                    contract_symbol = None
+            if contract_symbol is None and option_id is not None:
+                option_ids.append(option_id)
+            rows.append({"option_id": option_id, "contract_symbol": contract_symbol,
+                         "quantity": quantity, "avg_price": avg_price, "pending_qty": pending})
+        if option_ids:
+            for option_id in dict.fromkeys(option_ids):
+                try:
+                    symbol = self._occ_for_option(option_id)
+                except MCPError:
+                    continue
+                for row in rows:
+                    if row["option_id"] == option_id and row["contract_symbol"] is None:
+                        row["contract_symbol"] = symbol
+        return rows
 
     def get_orders(self, status=None):
         args = self._account_args()
+        want_open = False
         if status is not None:
-            args["status"] = status
+            if status == "open":
+                want_open = True  # no server-side "open" filter; filter client-side below
+            elif type(status) is str and status in _ORDER_STATES:
+                args["state"] = status
+            else:
+                raise MCPError("Unsupported order status filter")
         data = self.call_tool(self._tool_for("orders"), args)
-        if type(data) is not list:
+        if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
             raise MCPError("Unsupported orders result")
-        orders = [self.normalize_order(x) for x in data]
-        if any("account_number" in x and x["account_number"] != self.account_number for x in orders):
-            raise MCPError("Orders snapshot account mismatch")
+        orders = []
+        for row in data["orders"]:
+            order = self.normalize_order(row)
+            if "account_number" in row and row["account_number"] != self.account_number:
+                raise MCPError("Orders snapshot account mismatch")
+            if want_open and order["status"] not in {"pending", "partially_filled"}:
+                continue
+            orders.append(self._resolve_order_symbol(order))
         return orders

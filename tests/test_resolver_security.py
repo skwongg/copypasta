@@ -20,7 +20,7 @@ class FakeMCP:
             if isinstance(self.response, Exception):
                 raise self.response
             return self.response
-        return [{"underlying": underlying, "expiry": expiry, "strike": strike,
+        return [{"option_id": "test-option-id", "underlying": underlying, "expiry": expiry, "strike": strike,
                  "option_type": option_type,
                  "contract_symbol": resolver.occ_symbol(underlying, expiry, strike, option_type)}]
 

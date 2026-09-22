@@ -5,11 +5,16 @@ import hashlib
 import math
 import re
 import kill
+from mcp_client import MCPClient
 from trade_state import StateError
 
 UNRESOLVED = {'prepared', 'unknown', 'pending', 'partially_filled'}
 TERMINAL = {'filled', 'rejected', 'canceled'}
 LATCHES = {'sl': False, 'tp50': False, 'tp200': False, 'tp300': False}
+
+# Strict canonical UUID text: the broker order identity is never guessed.
+_UUID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                      r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 
 class OrderError(RuntimeError):
@@ -43,14 +48,17 @@ def apply_response(data, key, response, now):
     filled, avg = response.get('filled_qty'), response.get('avg_fill_price')
     if status not in UNRESOLVED | TERMINAL or status in {'prepared', 'unknown'}:
         raise OrderError('invalid_order_status')
-    if not isinstance(broker_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', broker_id):
+    if not isinstance(broker_id, str) or not _UUID_RE.fullmatch(broker_id):
         raise OrderError('invalid_broker_order_id')
     if order.get('broker_order_id') not in (None, broker_id):
         raise OrderError('broker_order_identity_changed')
-    for field in ('contract_symbol', 'side', 'quantity', 'client_order_id'):
-        expected = order['intent_id'] if field == 'client_order_id' else order[field]
-        if response.get(field) != expected:
+    for field in ('contract_symbol', 'side', 'quantity'):
+        if response.get(field) != order[field]:
             raise OrderError('broker_order_intent_mismatch')
+    if response.get('ref_id') != order['ref_id']:
+        raise OrderError('broker_order_intent_mismatch')
+    if response.get('option_id') != order['option_id']:
+        raise OrderError('broker_order_intent_mismatch')
     if type(filled) is not int or not order['filled_qty'] <= filled <= order['quantity']:
         raise OrderError('invalid_cumulative_fill')
     if (filled > 0 and not finite_positive(avg)) or (filled == 0 and avg not in (None, 0)):
@@ -79,7 +87,8 @@ def apply_response(data, key, response, now):
         position = next((p for p in positions if p['position_id'] == order['position_id']), None)
         if order['side'] == 'buy':
             if position is None:
-                position = {'position_id': order['position_id'], 'contract_symbol': order['contract_symbol'],
+                position = {'position_id': order['position_id'], 'option_id': order['option_id'],
+                            'contract_symbol': order['contract_symbol'],
                             'underlying': order['underlying'], 'qty_initial': 0, 'qty_remaining': 0,
                             'fill_price': avg, 'latches': dict(LATCHES), 'status': 'open'}
                 positions.append(position)
@@ -116,7 +125,7 @@ def reconcile(tx, mcp, now):
         if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
             raise OrderError('invalid_order_snapshot')
         for order in pending:
-            matches = [r for r in rows if r.get('client_order_id') == order['intent_id']]
+            matches = [r for r in rows if r.get('ref_id') == order['ref_id']]
             if len(matches) != 1:
                 raise OrderError('order_outcome_unresolved')
             tx.data = apply_response(tx.data, order['intent_id'], matches[0], now)
@@ -131,7 +140,12 @@ def reconcile(tx, mcp, now):
 
 
 def verify_broker_positions(data, mcp):
-    """Dedicated account: any unexplained position blocks mutations."""
+    """Dedicated account: any unexplained position blocks mutations.
+
+    Positions are keyed by broker instrument id, falling back to the OCC
+    symbol when the snapshot row carries no id. Either side must identify
+    the same contract.
+    """
     if mcp.mode != 'live':
         return
     rows = mcp.get_positions()
@@ -139,16 +153,19 @@ def verify_broker_positions(data, mcp):
         raise OrderError('invalid_broker_position_snapshot')
     actual, managed = {}, {}
     for row in rows:
-        if not isinstance(row, dict) or type(row.get('quantity')) is not int or row['quantity'] < 0 or not isinstance(row.get('contract_symbol'), str):
+        if not isinstance(row, dict) or type(row.get('quantity')) is not int or row['quantity'] < 0:
+            raise OrderError('invalid_broker_position_snapshot')
+        key = row.get('option_id') or row.get('contract_symbol')
+        if not isinstance(key, str) or not key:
             raise OrderError('invalid_broker_position_snapshot')
         if row['quantity']:
-            symbol = row['contract_symbol']
-            if symbol in actual:
+            if key in actual:
                 raise OrderError('duplicate_broker_position')
-            actual[symbol] = row['quantity']
+            actual[key] = row['quantity']
     for p in data['positions']:
         if p['qty_remaining']:
-            managed[p['contract_symbol']] = managed.get(p['contract_symbol'], 0) + p['qty_remaining']
+            key = p.get('option_id') or p['contract_symbol']
+            managed[key] = managed.get(key, 0) + p['qty_remaining']
     if actual != managed:
         raise OrderError('broker_positions_do_not_reconcile')
     # Unexpected live open orders also reserve funds/holdings outside our ledger.
@@ -167,7 +184,10 @@ def submit(tx, store, mcp, order, now, *, paper_price, validate=None):
         mcp.assert_mutation_allowed()
     if validate is not None:
         validate()
-    order = dict(order, status='prepared', filled_qty=0, avg_fill_price=None, broker_order_id=None)
+    # Deterministic idempotency key: retries of this logical order reuse it.
+    ref_id = MCPClient.make_ref_id(key)
+    order = dict(order, status='prepared', filled_qty=0, avg_fill_price=None,
+                 broker_order_id=None, ref_id=ref_id)
     tx.data['orders'][key] = order
     tx.save()  # intent exists before an external side effect or process crash
     try:
@@ -182,15 +202,18 @@ def submit(tx, store, mcp, order, now, *, paper_price, validate=None):
     try:
         if mcp.mode == 'dry_run':
             response = {
-                'order_id': 'PAPER-' + key, 'client_order_id': key,
+                'order_id': MCPClient.make_ref_id('paper-order:' + key),
+                'ref_id': ref_id, 'option_id': order['option_id'],
                 'contract_symbol': order['contract_symbol'], 'side': order['side'],
                 'quantity': order['quantity'], 'status': 'filled',
                 'filled_qty': order['quantity'], 'avg_fill_price': paper_price,
             }
         else:
             response = mcp.place_option_order(
-                order['contract_symbol'], order['side'], order['quantity'],
-                order['order_type'], order.get('limit_price'), client_order_id=key,
+                option_id=order['option_id'], side=order['side'],
+                position_effect=order['position_effect'], qty=order['quantity'],
+                order_type=order['order_type'], limit_price=order['limit_price'],
+                ref_id=order['ref_id'],
             )
         tx.data = apply_response(tx.data, key, response, now)
         tx.save()
