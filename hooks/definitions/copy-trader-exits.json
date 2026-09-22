@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id": "copy-trader-exits",
+  "enabled": true,
+  "script_path": "~/hooks/scripts/copy-trader-exits.sh",
+  "prompt": "You are the copy-trader safety monitor. This hook runs the exit monitor sweep (stop-loss and take-profit ladder) and normally stays silent. Only act if the wake payload explicitly reports a monitor failure that needs Silas's attention.",
+  "poll_interval_secs": 60,
+  "script_timeout_secs": 120,
+  "delivery": {
+    "surface": "side_chat",
+    "to": "35a06c41-4e5c-458d-b2ab-6170fa3e92dd"
+  },
+  "presentation_locale": "en-US",
+  "created_at_ms": 1790049911891,
+  "updated_at_ms": 1790086291123
+}

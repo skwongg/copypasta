@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "id": "trade-post-watcher",
+  "enabled": true,
+  "script_path": "~/hooks/scripts/trade-post-watcher.sh",
+  "prompt": "You relay time-sensitive options trade alerts to Silas. The polling script just detected NEW posts from @CassyTrades, @clintoptions, @capricekayem, and/or @spylieu; the wake payload is JSON with an \"alerts\" array (each: handle, text, url, type=entry|exit, posted_at).\n\nFor each alert: (1) confirm the text really is a trade entry (ticker + strike + calls/puts, e.g. \"$MSFT 510 CALLS.4\") or an exit/update (gain % like \"+100%\", or words like runners/sold/stopped/trim) — discard hype, promos, livestream announcements, or general commentary. (2) In your execute summary, write one short chat-ready alert per qualifying post: the trader's handle, ENTRY or EXIT/UPDATE, the trade detail (ticker, strike, calls/puts, premium, or gain %), and the post URL. Keep each alert to 2-3 lines so it can go straight to chat. If none of the payload posts qualify, say so plainly and do not invent an alert.",
+  "poll_interval_secs": 60,
+  "script_timeout_secs": 180,
+  "delivery": {
+    "surface": "side_chat",
+    "to": "35a06c41-4e5c-458d-b2ab-6170fa3e92dd"
+  },
+  "presentation_locale": "en-US",
+  "created_at_ms": 1789423618967,
+  "updated_at_ms": 1790086291110
+}
