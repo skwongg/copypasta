@@ -27,6 +27,7 @@ case "$STATUS" in
     # exists (disarmed = text-only alerts). Deployment review complete 2026-09-22;
     # fire_entries.py --mode live is enabled with all gates active.
     if [ -f "$HOME/workspace/copy-trader/ARMED" ]; then
+      export COPYTRADER_CONFIG="$HOME/workspace/copy-trader/policy.json"
       printf '%s' "$RESULT" | python3 "$HOME/workspace/copy-trader/sign_alerts.py" \
         | "$HOME/workspace/copy-trader/fire_entries.py" --alerts-json /dev/stdin --mode live >>"$HOME/workspace/copy-trader/fire.log" 2>&1 || true
     fi
