@@ -229,7 +229,9 @@ class EngineSecurityTests(unittest.TestCase):
     def test_invalid_stale_or_future_quotes_do_not_create_order_intents(self):
         variations = ({"ask": float("nan")}, {"ask": float("inf")}, {"ask": -1}, {"ask": 0}, {"ask": True},
                       {"as_of": (NOW - timedelta(seconds=31)).isoformat()},
-                      {"as_of": (NOW + timedelta(seconds=1)).isoformat()}, {"as_of": "not-a-date"},
+                      # Future-dating beyond the clock-skew tolerance is rejected;
+                      # within tolerance (broker clock ~1s ahead, 2026-09-23) is accepted.
+                      {"as_of": (NOW + timedelta(seconds=6)).isoformat()}, {"as_of": "not-a-date"},
                       {"as_of": "2026-09-21T17:00:00"})
         for number, changes in enumerate(variations):
             with self.subTest(changes=changes):

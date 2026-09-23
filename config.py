@@ -14,6 +14,10 @@ MAX_OPEN_EXPOSURE = 5000.0
 DAILY_LOSS_CAP = 2500.0
 MAX_ENTRY_SLIPPAGE = 0.10
 MAX_QUOTE_AGE_SECONDS = 30
+# Broker quote timestamps may run slightly ahead of our clock; tolerate a few
+# seconds of future-dating so fresh quotes are not rejected as invalid.
+# 2026-09-23: ~1s broker clock skew blocked every live quote check.
+MAX_QUOTE_SKEW_SECONDS = 5
 TRADERS = {'cassytrades': '0DTE', 'clintoptions': None, 'capricekayem': None, 'spylieu': None}
 MARKET_HOLIDAYS = {
     '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25', '2026-06-19',

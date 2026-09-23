@@ -46,7 +46,7 @@ def quote_price(quote, field, now, symbol=None):
         if timestamp.tzinfo is None:
             raise ValueError()
         age = (now.astimezone(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
-        if not 0 <= age <= config.MAX_QUOTE_AGE_SECONDS:
+        if not -config.MAX_QUOTE_SKEW_SECONDS <= age <= config.MAX_QUOTE_AGE_SECONDS:
             raise ValueError()
     except (KeyError, TypeError, ValueError):
         raise OrderError('stale_or_invalid_quote') from None
