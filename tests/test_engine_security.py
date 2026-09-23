@@ -438,6 +438,31 @@ class EngineSecurityTests(unittest.TestCase):
         self.assertEqual(data["positions"][0]["qty_remaining"], 3)
         self.assertEqual(sum(c[0] == "place" for c in broker.calls), 1)
 
+    def test_unparseable_place_response_halts_with_structural_fingerprint(self):
+        # Regression for the 2026-09-23 live fill: the broker accepted the
+        # order but the confirmation arrived in a shape the parser could not
+        # read. The halt must carry the response's structure (keys and types
+        # only, never values) so the parser can be taught the new shape.
+        state, broker = self.local_protocol_state(), FakeBroker("live")
+        order = self.order(state)
+        broker.place_response = {"confirmation": {"orderRef": "abc-123", "token": "sekret"},
+                                 "result": "OK", "filled": 3}
+        with self.assertRaises(OrderError), state.transaction() as tx:
+            submit(tx, state, broker, order, NOW, paper_price=1.1)
+        data = state.snapshot()
+        self.assertEqual(data["orders"][order["intent_id"]]["status"], "unknown")
+        self.assertEqual(data["halt_reason"], "unknown_order_outcome")
+        self.assertEqual(data["positions"], [])
+        diag = [e for e in data["events"] if e["event"] == "unparseable_order_response"]
+        self.assertEqual(len(diag), 1)
+        self.assertEqual(diag[0]["intent_id"], order["intent_id"])
+        self.assertEqual(diag[0]["fingerprint"],
+                         {"confirmation": {"orderRef": "str", "token": "str"},
+                          "result": "str", "filled": "int"})
+        blob = json.dumps(diag[0])
+        self.assertNotIn("abc-123", blob)
+        self.assertNotIn("sekret", blob)
+
     def test_invalid_order_identity_status_or_execution_does_not_modify_data(self):
         order = dict(self.order(self.state), status="prepared", filled_qty=0, avg_fill_price=None, broker_order_id=None)
         data = self.state.snapshot()

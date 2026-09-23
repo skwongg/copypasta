@@ -21,6 +21,25 @@ class OrderError(RuntimeError):
     pass
 
 
+def _response_fingerprint(value, depth=0):
+    """Structural shape of a broker response: keys and value types only.
+
+    Recorded when a place response cannot be parsed, so the next
+    unknown_order_outcome halt carries exactly what the parser needs to
+    learn. Never includes values: no ids, prices, tokens, or PII.
+    """
+    if depth > 2:
+        return '...'
+    if isinstance(value, dict):
+        return {str(k): _response_fingerprint(v, depth + 1)
+                for k, v in list(value.items())[:25]}
+    if isinstance(value, list):
+        if not value:
+            return 'list[0]'
+        return ['list[%d]' % len(value), _response_fingerprint(value[0], depth + 1)]
+    return type(value).__name__
+
+
 def finite_positive(value):
     try:
         return type(value) in (int, float) and math.isfinite(value) and value > 0
@@ -190,6 +209,7 @@ def submit(tx, store, mcp, order, now, *, paper_price, validate=None):
                  broker_order_id=None, ref_id=ref_id)
     tx.data['orders'][key] = order
     tx.save()  # intent exists before an external side effect or process crash
+    response = None
     try:
         if validate is not None:
             validate()
@@ -222,5 +242,10 @@ def submit(tx, store, mcp, order, now, *, paper_price, validate=None):
         if tx.data['orders'][key]['status'] != 'rejected':
             tx.data['orders'][key]['status'] = 'unknown'
             tx.data['halt_reason'] = 'unknown_order_outcome'
+            if response is not None:
+                # Capture the shape the parser could not read (keys/types only,
+                # never values) so the halt is diagnosable, not a mystery.
+                event(tx.data, 'unparseable_order_response', now, intent_id=key,
+                      fingerprint=_response_fingerprint(response))
             tx.save()
         raise OrderError('order_outcome_unresolved') from None
