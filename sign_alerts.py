@@ -66,10 +66,12 @@ _TIMESTAMP_RE = re.compile(r"^(\d+[smh]|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|O
 def clean_text(text):
     lines = text.split("\n")
     start = 0
-    for i, line in enumerate(lines[:6]):
+    # Skip ALL leading header blocks (display name / @handle / timestamp);
+    # X article views can stack several (e.g. repost + post). Do not break
+    # after the first or the "first content line" below lands mid-chrome.
+    for i, line in enumerate(lines[:10]):
         if line.startswith("@") and i + 1 < len(lines) and _TIMESTAMP_RE.match(lines[i + 1].strip()):
             start = i + 2
-            break
     first = "\n".join(lines[start:]).strip().split("\n", 1)[0].strip()
     return first or text
 

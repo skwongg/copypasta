@@ -83,6 +83,22 @@ class SignerTests(unittest.TestCase):
             admission.admit(alert, "live", policy(), NOW)
         self.assertEqual(str(ctx.exception), "invalid_source_signature")
 
+    def test_clean_text_skips_stacked_chrome_headers(self):
+        # Real X article views can stack several header blocks
+        # (display name / @handle / timestamp), e.g. repost + post.
+        # 2026-09-23: two stacked headers made clean_text return "Cass 🌙",
+        # so the resolver failed closed on a genuine $SPY 770 PUTS entry.
+        raw = ("Cass 🌙\n@CassyTrades\n17s\n"
+               "Cass 🌙\n@CassyTrades\n17m\n"
+               "$SPY 770 PUTS .30\n7")
+        self.assertEqual(sign_alerts.clean_text(raw), "$SPY 770 PUTS .30")
+        # Single header still works.
+        single = "Cass 🌙\n@CassyTrades\n45s\n$SPY 770 PUTS .30\n3\n3\n1K"
+        self.assertEqual(sign_alerts.clean_text(single), "$SPY 770 PUTS .30")
+        # No chrome passes through unchanged.
+        self.assertEqual(sign_alerts.clean_text("$SPY 770 PUTS .30"),
+                         "$SPY 770 PUTS .30")
+
     def test_unsigned_alert_rejected_in_live_mode(self):
         # Missing the whole authenticated-producer envelope fails at schema.
         with self.assertRaises(admission.AdmissionError) as ctx:
