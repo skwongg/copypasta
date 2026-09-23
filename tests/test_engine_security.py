@@ -208,6 +208,24 @@ class EngineSecurityTests(unittest.TestCase):
         with self.assertRaises(AdmissionError):
             admit({**alert, "text": "$QQQ 734c 99.99 0DTE"}, "live", policy, NOW)
 
+    def test_mixed_case_handle_url_admits_real_x_post_format(self):
+        # Real X post URLs carry the account's display case (/CassyTrades/),
+        # while admission normalizes the handle to lowercase. The URL check
+        # must be case-insensitive, or every mixed-case-handle alert is
+        # wrongly rejected with source_url_mismatch.
+        policy = Policy(sources={"cassytrades": "TEST_SOURCE_ID"},
+                        source_key=b"TEST-ONLY-NOT-A-CREDENTIAL-KEY-0001")
+        alert = self.alert(handle="CassyTrades", url="https://x.com/CassyTrades/status/123")
+        alert["signature"] = hmac.new(policy.source_key, signed_bytes(alert), hashlib.sha256).hexdigest()
+        admitted = admit(alert, "live", policy, NOW)
+        self.assertEqual(admitted["handle"], "cassytrades")
+        self.assertEqual(admitted["id"], "123")
+        # A URL pointing at a different handle must still be rejected.
+        bad = self.alert(handle="CassyTrades", url="https://x.com/clintoptions/status/123")
+        bad["signature"] = hmac.new(policy.source_key, signed_bytes(bad), hashlib.sha256).hexdigest()
+        with self.assertRaises(AdmissionError):
+            admit(bad, "live", policy, NOW)
+
     def test_invalid_stale_or_future_quotes_do_not_create_order_intents(self):
         variations = ({"ask": float("nan")}, {"ask": float("inf")}, {"ask": -1}, {"ask": 0}, {"ask": True},
                       {"as_of": (NOW - timedelta(seconds=31)).isoformat()},

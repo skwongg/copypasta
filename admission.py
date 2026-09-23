@@ -39,7 +39,11 @@ def admit(alert, mode, policy, now):
         raise AdmissionError('invalid_source_url') from None
     if url.scheme != 'https' or url.netloc != 'x.com' or url.params or url.query or url.fragment:
         raise AdmissionError('invalid_source_url')
-    if url.path != f'/{handle}/status/{alert["id"]}':
+    # X handles are case-insensitive and real post URLs carry the account's
+    # display case (e.g. /CassyTrades/status/...), while `handle` above is
+    # normalized to lowercase. Compare case-insensitively or every alert
+    # from a mixed-case handle is wrongly rejected.
+    if url.path.lower() != f'/{handle}/status/{alert["id"]}'.lower():
         raise AdmissionError('source_url_mismatch')
     try:
         posted = datetime.fromisoformat(alert['posted_at'])
