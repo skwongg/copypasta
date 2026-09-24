@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Copy-trader exit monitor hook.
 # Runs run_exits.py --mode live every poll (60s) during market hours. Each
-# sweep reconciles orders, reprices resting exit sells at the current bid,
-# cancels stale entry buys and applies the stop-loss / take-profit ladder.
+# sweep reconciles orders, reprices a resting stop-loss at the current bid,
+# cancels stale entry buys and applies the stop-loss / fixed take-profit ladder.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 

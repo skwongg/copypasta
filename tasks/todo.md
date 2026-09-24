@@ -33,7 +33,8 @@ Live account check on 9/24: the bot's entries fired on 9/23 (7x SPY 768P) and 9/
 
 - [x] Reconcile pending orders by broker order id; for a lost place response, fall back to the single unclaimed agentic order for the same contract/side/qty created after submission. `ref_id` is checked only when the broker echoes it.
 - [x] Broker is the truth for holdings: hand closes/trims become `external_close` events and the rest stays managed. Holdings the bot never bought still block.
-- [x] Each exit sweep cancels a resting exit sell whose limit is above the bid (>=45s old) and re-places it at the current bid, and cancels an entry buy still open after 2 minutes.
+- [x] Each exit sweep cancels a resting stop-loss sell whose limit is above the bid (>=45s old) and re-places it at the current bid, and cancels an entry buy still open after 2 minutes.
+- [x] Take-profits sell at the exact rung price (rounded up to the tick) and never move. A resting take-profit doesn't block the account; when the stop triggers it is canceled first and the stop sells everything at the bid.
 - [x] Arm/kill lives only in the live state dir; the hooks no longer read checkout `ARMED`/`KILL`/`positions.json`. Live CLIs refuse locally before any broker call when disarmed/halted. `kill.py --mode live` finds the account itself.
 - [x] Live CLIs wait up to 30s for the shared state lock instead of dropping the alert.
 - [x] Notifier drains live state; the watcher wake carries the copy-trader result for the chat relay.

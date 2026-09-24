@@ -247,6 +247,80 @@ class LivePipelineTests(unittest.TestCase):
         self.sweep()
         self.assertEqual(self.snapshot()["positions"][0]["qty_remaining"], 0)
 
+    def rest_take_profit(self):
+        """15 @ 0.33, then +50% is crossed and its 7-lot limit at the rung (0.50) rests unfilled."""
+        self.fire()
+        self.rh.place_state = "confirmed"
+        self.rh.bid, self.rh.ask = 0.52, 0.53
+        self.advance(60)
+        self.sweep()
+        self.assertEqual([(o["quantity"], o["price"], o["state"]) for o in self.sells()],
+                         [("7.00000", "0.50000000", "confirmed")])
+
+    def test_take_profit_is_placed_at_the_rung_price_not_the_bid(self):
+        self.fire()
+        self.rh.bid, self.rh.ask = 0.60, 0.61      # well past +50% (0.495)
+        self.advance(60)
+        self.sweep()
+        self.assertEqual(self.rh.placed[-1]["price"], "0.50")   # rung rounded up to the tick
+        fills = [e for e in self.snapshot()["events"] if e["event"] == "exit_fill"]
+        self.assertEqual(round(fills[0]["price"], 2), 0.60)    # a marketable limit fills at the bid
+
+    def test_take_profit_rung_uses_the_tick_for_its_own_price(self):
+        # Penny under $3, nickel at or above it (cutoff 3.00).
+        self.rh.min_ticks = {"above_tick": "0.05", "below_tick": "0.01", "cutoff_price": "3.00"}
+        self.rh.bid, self.rh.ask = 1.21, 1.22
+        self.fire(self.alert("$SPY 769 CALLS 1.22"))           # 4 @ 1.22
+        self.rh.bid, self.rh.ask = 3.70, 3.75
+        self.advance(60)
+        self.sweep()
+        # +50% rung 1.83 stays on the penny tick; +200% rung 3.66 rounds up to 3.70.
+        self.assertEqual([p["price"] for p in self.rh.placed[1:]], ["1.83", "3.70"])
+
+    def test_resting_take_profit_never_moves(self):
+        self.rest_take_profit()
+        for bid in (0.50, 0.45, 0.49, 0.47):
+            self.rh.bid, self.rh.ask = bid, bid + 0.01
+            self.advance(60)
+            self.sweep()
+        self.assertEqual([(o["price"], o["state"]) for o in self.sells()], [("0.50000000", "confirmed")])
+        self.assertIsNone(self.snapshot()["halt_reason"])
+
+    def test_stop_fires_through_a_resting_take_profit(self):
+        self.rest_take_profit()
+        self.rh.bid, self.rh.ask = 0.12, 0.13      # collapses below the 40% stop (0.132)
+        self.rh.place_state = "filled"
+        self.advance(60)
+        self.sweep()
+        self.assertEqual([(o["quantity"], o["price"], o["state"]) for o in self.sells()],
+                         [("15.00000", "0.12000000", "filled"), ("7.00000", "0.50000000", "cancelled")])
+        data = self.snapshot()
+        self.assertIsNone(data["halt_reason"])
+        self.assertEqual(data["positions"][0]["qty_remaining"], 0)
+
+    def test_stop_waits_for_a_take_profit_cancel_to_settle(self):
+        self.rest_take_profit()
+        self.rh.cancel_settles = False               # broker reports pending_cancelled for now
+        self.rh.bid, self.rh.ask = 0.12, 0.13
+        self.advance(60)
+        self.sweep()
+        self.assertEqual(len(self.sells()), 1)      # no stop while contracts are still reserved
+        self.rh.cancel_settles = True
+        self.rh.sells_settle_cancel()
+        self.rh.place_state = "filled"
+        self.advance(60)
+        self.sweep()
+        self.assertEqual(self.sells()[0]["quantity"], "15.00000")
+        self.assertEqual(self.snapshot()["positions"][0]["qty_remaining"], 0)
+
+    def test_resting_take_profit_does_not_block_new_entries(self):
+        self.rest_take_profit()
+        self.rh.place_state = "filled"
+        self.rh.bid, self.rh.ask = 0.32, 0.33
+        self.advance(60)
+        rc, out = self.fire()
+        self.assertEqual(len([p for p in self.rh.placed if p["legs"][0]["side"] == "buy"]), 2, out)
+
     def test_manual_close_is_recorded_and_trading_continues(self):
         self.fire()
         self.rh.manual_close_all()

@@ -506,7 +506,8 @@ class TransportSecurity(unittest.TestCase):
         symbol = SYMBOL
         instrument = {"id": OPTION_ID, "chain_symbol": "SPY", "expiration_date": "2026-09-25",
                       "type": "call", "strike_price": "700.0000", "state": "active",
-                      "tradability": "tradable", "trade_value_multiplier": "100"}
+                      "tradability": "tradable", "trade_value_multiplier": "100",
+                      "min_ticks": {"above_tick": "0.01", "below_tick": "0.01", "cutoff_price": "0.00"}}
         tools = [definition("get_option_chains", CHAINS_PROPERTIES),
                  definition("get_option_instruments", INSTRUMENTS_PROPERTIES),
                  definition("get_option_quotes", QUOTES_PROPERTIES),

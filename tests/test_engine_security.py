@@ -594,14 +594,15 @@ class EngineSecurityTests(unittest.TestCase):
         self.assertEqual(result.reason, "daily_loss_limit")
         self.assertEqual(self.state.snapshot()["orders"], {})
 
-    def test_exit_monitor_paper_sale_is_limited_at_bid(self):
+    def test_exit_monitor_take_profit_is_limited_at_its_rung_price(self):
         self.seed_position()
         self.client.quote.update(bid=1.70, ask=1.80)
         notes = ExitMonitor(self.client, state=self.state).check(now=NOW)
         self.assertEqual(notes[-1]["kind"], "fired")
         data = self.state.snapshot()
         sale = next(iter(data["orders"].values()))
-        self.assertEqual((sale["side"], sale["order_type"], sale["limit_price"]), ("sell", "limit", 1.70))
+        # Fixed ladder: +50% of the 1.00 fill, not the 1.70 bid.
+        self.assertEqual((sale["side"], sale["order_type"], sale["limit_price"]), ("sell", "limit", 1.50))
         self.assertEqual(data["positions"][0]["qty_remaining"], 2)
         self.assertTrue(data["positions"][0]["latches"]["tp50"])
         self.assertFalse(any(call[0] == "place" for call in self.client.calls))

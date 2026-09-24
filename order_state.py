@@ -12,6 +12,7 @@ from trade_state import StateError
 UNRESOLVED = {'prepared', 'unknown', 'pending', 'partially_filled'}
 TERMINAL = {'filled', 'rejected', 'canceled'}
 LATCHES = {'sl': False, 'tp50': False, 'tp200': False, 'tp300': False}
+TAKE_PROFIT_RUNGS = frozenset({'tp50', 'tp200', 'tp300'})
 
 # Strict canonical UUID text: the broker order identity is never guessed.
 _UUID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
@@ -143,6 +144,21 @@ def apply_response(data, key, response, now):
     return updated
 
 
+def is_resting_take_profit(order):
+    """A take-profit sell working at the broker at its fixed rung price.
+
+    It is expected to rest until the market comes back to it, so it does not
+    freeze the account the way an unresolved entry or stop does.
+    """
+    return (order['side'] == 'sell' and order.get('rung') in TAKE_PROFIT_RUNGS
+            and order['status'] in {'pending', 'partially_filled'} and bool(order.get('broker_order_id')))
+
+
+def blocking_orders(data):
+    """Unresolved orders that must be reconciled before any new decision."""
+    return [o for o in data['orders'].values() if o['status'] in UNRESOLVED and not is_resting_take_profit(o)]
+
+
 def _broker_row(rows, order, claimed):
     """The broker row for one of our orders.
 
@@ -245,42 +261,22 @@ def verify_broker_positions(data, mcp, now=None):
     if actual != managed:
         raise OrderError('broker_positions_do_not_reconcile')
     # Unexpected live open orders also reserve funds/holdings outside our ledger.
+    ours = {o.get('broker_order_id') for o in data['orders'].values() if o['status'] in UNRESOLVED} - {None}
     rows = mcp.get_orders(status='open')
-    if not isinstance(rows, list) or rows:
+    if not isinstance(rows, list) or any(not isinstance(r, dict) or r.get('order_id') not in ours for r in rows):
         raise OrderError('broker_open_orders_require_review')
     return changed
 
 
-def cancel_stale_orders(tx, mcp, now, *, sell_after, buy_after, polls=4, pause=1.0, sleep=None):
-    """Cancel our resting orders that are too old to still be right.
+def cancel_orders(tx, mcp, now, keys, *, polls=4, pause=1.0, sleep=None):
+    """Request cancellation of our working orders and poll until they settle.
 
-    A sell older than ``sell_after`` seconds (a stop or take-profit limit the
-    market moved away from) is canceled so the exit sweep can re-place it at
-    the current bid. A buy older than ``buy_after`` is canceled for good: the
-    alert's price is gone, and a resting entry would freeze every exit.
-    Cancellation is asynchronous at the broker, so the order is polled a few
-    times; anything still open is left for the next sweep's reconcile.
+    Cancellation is asynchronous at the broker, so each order is polled a few
+    times. Returns the keys still unresolved; the next sweep's reconcile picks
+    those up. A canceled sale we asked for never halts the account.
     """
     sleep = sleep or time.sleep
-    stale = []
-    for order in tx.data['orders'].values():
-        if order['status'] not in {'pending', 'partially_filled'} or not order.get('broker_order_id'):
-            continue
-        try:
-            age = (now - datetime.fromisoformat(order['submitted_at'])).total_seconds()
-        except (KeyError, TypeError, ValueError):
-            age = float('inf')
-        if age < (sell_after if order['side'] == 'sell' else buy_after):
-            continue
-        if order['side'] == 'sell' and not order.get('cancel_requested'):
-            try:
-                bid = mcp.get_option_quote(order['option_id'])['bid']
-                if finite_positive(bid) and bid >= order['limit_price']:
-                    continue  # still at the bid; keep its place in the queue
-            except Exception:
-                pass
-        stale.append(order['intent_id'])
-    for key in stale:
+    for key in keys:
         order = tx.data['orders'][key]
         if not order.get('cancel_requested'):
             order['cancel_requested'] = True
@@ -296,6 +292,39 @@ def cancel_stale_orders(tx, mcp, now, *, sell_after, buy_after, polls=4, pause=1
                 break
             if attempt + 1 < polls:
                 sleep(pause)
+    return [key for key in keys if tx.data['orders'][key]['status'] in UNRESOLVED]
+
+
+def cancel_stale_orders(tx, mcp, now, *, sell_after, buy_after, **polling):
+    """Cancel resting stop-loss sells the market moved away from, and stale entries.
+
+    A stop-loss sell older than ``sell_after`` seconds whose limit is above the
+    current bid is canceled so the exit sweep re-places it at the bid. A buy
+    older than ``buy_after`` is canceled for good: the alert's price is gone,
+    and a resting entry would freeze every exit. Take-profits are never
+    repriced; they hold at their fixed rung price.
+    """
+    stale = []
+    for order in tx.data['orders'].values():
+        if order['status'] not in {'pending', 'partially_filled'} or not order.get('broker_order_id'):
+            continue
+        if order['side'] == 'sell' and order.get('rung') != 'sl':
+            continue
+        try:
+            age = (now - datetime.fromisoformat(order['submitted_at'])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            age = float('inf')
+        if age < (sell_after if order['side'] == 'sell' else buy_after):
+            continue
+        if order['side'] == 'sell' and not order.get('cancel_requested'):
+            try:
+                bid = mcp.get_option_quote(order['option_id'])['bid']
+                if finite_positive(bid) and bid >= order['limit_price']:
+                    continue  # still at the bid; keep its place in the queue
+            except Exception:
+                pass
+        stale.append(order['intent_id'])
+    cancel_orders(tx, mcp, now, stale, **polling)
     return stale
 
 

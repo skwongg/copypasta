@@ -64,6 +64,8 @@ class FakeRobinhood:
         self.orders = []                # internal rows (with our private _ref_id)
         self.positions = {}             # option_id -> qty
         self.placed = []                # audit of place calls
+        self.cancel_settles = True      # False: cancels sit in pending_cancelled
+        self.min_ticks = {"above_tick": "0.01", "below_tick": "0.01", "cutoff_price": "0.00"}   # SPY, real
 
     # ---- broker-side events -------------------------------------------------
     def fill(self, order_id, price=None):
@@ -108,7 +110,8 @@ class FakeRobinhood:
     def _instrument(self):
         return {"id": OPTION_ID, "chain_id": CHAIN_ID, "chain_symbol": "SPY", "underlying_type": "equity",
                 "expiration_date": EXPIRY, "strike_price": STRIKE, "type": "call", "state": "active",
-                "tradability": "tradable", "trade_value_multiplier": "100.0000"}
+                "tradability": "tradable", "trade_value_multiplier": "100.0000",
+                "min_ticks": dict(self.min_ticks)}
 
     def t_get_option_instruments(self, args):
         if args.get("ids") == OPTION_ID:
@@ -143,7 +146,8 @@ class FakeRobinhood:
         self.orders.insert(0, row)
         self.placed.append(dict(args))
         if self.place_state == "filled":
-            self.fill(row["id"])
+            limit = float(args["price"])
+            self.fill(row["id"], price=max(limit, self.bid) if leg["side"] == "sell" else min(limit, self.ask))
             return {"order": self._public(row, place=True)}
         # Real working-order acknowledgement (2026-09-24): no legs, "direction"
         # instead of "side", state "pending"; the order list later shows it in full.
@@ -158,8 +162,13 @@ class FakeRobinhood:
 
     def t_cancel_option_order(self, args):
         row = next(o for o in self.orders if o["id"] == args["order_id"])
-        row["state"] = "cancelled"
+        row["state"] = "cancelled" if self.cancel_settles else "pending_cancelled"
         return {"order": self._public(row)}
+
+    def sells_settle_cancel(self):
+        for row in self.orders:
+            if row["state"] == "pending_cancelled":
+                row["state"] = "cancelled"
 
     def t_get_option_positions(self, args):
         return {"positions": [{"option_id": oid, "chain_symbol": "SPY", "expiration_date": EXPIRY, "type": "call",

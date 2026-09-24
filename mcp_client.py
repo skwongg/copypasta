@@ -668,6 +668,21 @@ class MCPClient:
         self._instrument_cache[option_id] = matches[0]
         return matches[0]
 
+    def price_tick(self, option_id, price):
+        """Minimum price increment for a limit at ``price`` on this contract.
+
+        From the instrument's min_ticks: below_tick under cutoff_price,
+        above_tick at or over it (e.g. $0.01 under $3, $0.05 above).
+        """
+        ticks = self._get_instrument(option_id).get("min_ticks")
+        if not isinstance(ticks, dict):
+            raise MCPError("Option instrument has no tick schedule")
+        cutoff = _parse_price(ticks.get("cutoff_price"))
+        tick = _parse_price(ticks.get("above_tick" if price >= cutoff else "below_tick"))
+        if not tick > 0:
+            raise MCPError("Invalid option tick size")
+        return tick
+
     def _occ_for_option(self, option_id):
         item = self._get_instrument(option_id)
         return _occ_symbol(item.get("chain_symbol"), item.get("expiration_date"),

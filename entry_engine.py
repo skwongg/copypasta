@@ -9,7 +9,7 @@ from admission import admit, AdmissionError
 import config
 import kill
 import resolver
-from order_state import UNRESOLVED, OrderError, event, finite_positive, intent_id, reconcile, submit, verify_broker_positions
+from order_state import UNRESOLVED, OrderError, blocking_orders, event, finite_positive, intent_id, reconcile, submit, verify_broker_positions
 from trade_state import TradingState, StateError
 
 
@@ -76,7 +76,7 @@ def process_entry(alert, mcp, mode='dry_run', *, state=None, policy=None, now=No
             mcp.assert_mutation_allowed()
         with state.transaction() as tx:
             reconcile(tx, mcp, now)
-            if tx.data['halt_reason'] or any(o['status'] in UNRESOLVED for o in tx.data['orders'].values()):
+            if tx.data['halt_reason'] or blocking_orders(tx.data):
                 return result('blocked', 'orders_require_reconciliation', mode)
             alert_key = f'{alert["handle"]}:{alert["id"]}'
             if alert_key in tx.data['alerts']:
