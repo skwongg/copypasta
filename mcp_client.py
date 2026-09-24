@@ -44,8 +44,10 @@ ALLOWED_TOOLS = frozenset(TOOL_NAMES.values())
 
 _OPTION_LEVELS = frozenset({"option_level_2", "option_level_3"})
 _ORDER_STATES = {
+    "pending": "pending",
     "queued": "pending",
     "confirmed": "pending",
+    "unconfirmed": "pending",
     "pending_cancelled": "pending",
     "partially_filled": "partially_filled",
     "filled": "filled",
@@ -830,7 +832,11 @@ class MCPClient:
         Normalized shape: {"order_id", "ref_id", "option_id", "contract_symbol",
         "side", "quantity", "status", "filled_qty", "avg_fill_price"}.
         Place/cancel responses nest the order under "order" (verified against a
-        real fill on 2026-09-22); order-list rows arrive flat. The top-level
+        real fill on 2026-09-22); order-list rows arrive flat. The synchronous
+        place acknowledgement (seen 2026-09-24) is a legless working-order
+        shape: state "pending"/"unconfirmed", "direction" instead of "side",
+        and pending_quantity/processed_quantity instead of executions; it
+        parses to a pending order with no fill price. The top-level
         "premium" is per-contract notional (price x 100) and is never a fill
         price; per-contract fills come from leg executions. Anything
         unexpected fails closed here.
@@ -880,6 +886,10 @@ class MCPClient:
             raise MCPError("Rejected order has unexpected fills")
         option_id = None
         side = data.get("side")
+        if side is None:
+            # The synchronous place acknowledgement carries "direction"
+            # instead of "side". Only the exact buy/sell values are accepted.
+            side = data.get("direction")
         legs = data.get("legs")
         if isinstance(legs, list) and legs:
             if len(legs) != 1 or not isinstance(legs[0], dict):
@@ -921,6 +931,12 @@ class MCPClient:
             # fingerprint (keys/types only) instead of halting blind.
             exc.raw_response = raw
             raise
+        if result["option_id"] is None:
+            # The synchronous place acknowledgement omits legs entirely, so
+            # the contract id is not echoed. It is established by the request
+            # we just made, and _resolve_order_symbol() below re-verifies it
+            # against the broker before anything is recorded.
+            result = dict(result, option_id=option_id)
         if "account_number" in result and result["account_number"] != self.account_number:
             raise MCPError("Order response account mismatch; reconciliation required")
         if (result["ref_id"] is not None and result["ref_id"] != ref_id):

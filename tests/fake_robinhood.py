@@ -144,7 +144,11 @@ class FakeRobinhood:
         self.placed.append(dict(args))
         if self.place_state == "filled":
             self.fill(row["id"])
-        return {"order": self._public(row, place=True)}
+            return {"order": self._public(row, place=True)}
+        # Real working-order acknowledgement (2026-09-24): no legs, "direction"
+        # instead of "side", state "pending"; the order list later shows it in full.
+        ack = {k: v for k, v in self._public(row, place=True).items() if k != "legs"}
+        return {"order": dict(ack, state="pending", direction=leg["side"], placed_agent="agentic")}
 
     def _public(self, row, place=False):
         out = {k: v for k, v in row.items() if k != "_ref_id"}

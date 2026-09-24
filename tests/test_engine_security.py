@@ -396,6 +396,25 @@ class EngineSecurityTests(unittest.TestCase):
         with state.transaction() as tx, self.assertRaises(OrderError):
             submit(tx, state, broker, order, NOW, paper_price=1.1)
 
+    def test_reconcile_falls_back_to_broker_order_id_when_ref_id_not_echoed(self):
+        # Live 2026-09-24: the broker never echoes our ref_id on order
+        # snapshots, so reconcile joins pending intents on the broker order
+        # id recorded at submission time.
+        state, broker = self.local_protocol_state(), FakeBroker("live")
+        order = self.order(state)
+        broker.place_response = self.response(order, "pending")
+        with state.transaction() as tx:
+            submitted = submit(tx, state, broker, order, NOW, paper_price=1.1)
+            self.assertEqual(submitted["status"], "pending")
+        snapshot = self.response(order, "filled", filled=3, avg=1.1, ref_id=None)
+        broker.orders = [snapshot]
+        with state.transaction() as tx:
+            reconcile(tx, broker, NOW)
+        data = state.snapshot()
+        self.assertEqual(data["orders"][order["intent_id"]]["status"], "filled")
+        self.assertIsNone(data["halt_reason"])
+        self.assertEqual(data["positions"][0]["qty_remaining"], 3)
+
     def test_prepare_is_durable_before_external_callback_and_crash(self):
         class SimulatedProcessCrash(BaseException):
             pass
