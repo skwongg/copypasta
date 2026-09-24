@@ -402,6 +402,55 @@ class TransportSecurity(unittest.TestCase):
                 mcp.MCPClient.normalize_order(order_row(state=status, processed_quantity=qty,
                                                         avg_fill_price=avg))
 
+    def test_normalize_order_accepts_legless_place_acknowledgement(self):
+        # Live broker shape 2026-09-24: the synchronous place acknowledgement
+        # is a legless working-order response with "direction" instead of
+        # "side" and pending/processed quantities instead of executions.
+        ack = {"order": {
+            "canceled_quantity": "0.00000", "chain_id": "33333333-3333-3333-3333-333333333333",
+            "chain_symbol": "SPY", "closing_strategy": None, "created_at": "2026-09-24T15:01:26.000000Z",
+            "direction": "buy", "id": ORDER_ID, "is_replaceable": True, "last_transaction_at": None,
+            "market_hours": "regular_hours", "opening_strategy": "open", "pending_quantity": "9.00000",
+            "placed_agent": "user", "premium": "55.00000000", "price": "0.55000000",
+            "processed_premium": "0", "processed_quantity": "0.00000", "quantity": "9",
+            "state": "pending", "stop_price": None, "time_in_force": "gfd",
+            "trade_value_multiplier": "100", "trigger": "immediate", "type": "limit",
+            "updated_at": "2026-09-24T15:01:26.000000Z"}}
+        norm = mcp.MCPClient.normalize_order(ack)
+        self.assertEqual((norm["order_id"], norm["side"], norm["quantity"],
+                          norm["status"], norm["filled_qty"], norm["avg_fill_price"],
+                          norm["option_id"]),
+                         (ORDER_ID, "buy", 9, "pending", 0, None, None))
+        # A working-order acknowledgement is never misread as a fill price.
+        self.assertIsNone(norm["avg_fill_price"])
+        # "unconfirmed" is the same accepted-and-working state.
+        unconfirmed = {"order": dict(ack["order"], state="unconfirmed")}
+        self.assertEqual(mcp.MCPClient.normalize_order(unconfirmed)["status"], "pending")
+
+    def test_normalize_order_direction_synonym_stays_strict(self):
+        ack = {"order": {"id": ORDER_ID, "state": "pending", "quantity": "1",
+                         "processed_quantity": "0", "pending_quantity": "1",
+                         "direction": "debit"}}
+        with self.assertRaises(mcp.MCPError):
+            mcp.MCPClient.normalize_order(ack)
+        # An explicit "side" still wins over "direction".
+        both = {"order": dict(ack["order"], side="sell")}
+        self.assertEqual(mcp.MCPClient.normalize_order(both)["side"], "sell")
+
+    def test_place_option_order_backfills_option_id_on_legless_ack(self):
+        ack = {"order": {"id": ORDER_ID, "state": "pending", "quantity": "1",
+                         "processed_quantity": "0", "pending_quantity": "1",
+                         "direction": "buy", "price": "1.00"}}
+        transport = FixtureTransport([definition("place_option_order", ORDER_PROPERTIES)], ack)
+        client = mcp.MCPClient(mode="live", account_number="TEST", transport=transport, mutation_guard=lambda: True)
+        # Symbol resolution is a broker read; pin it offline here.
+        client._resolve_order_symbol = lambda order: dict(order, contract_symbol=SYMBOL)
+        with patch.object(mcp, "LIVE_TRADING_ENABLED", True):
+            order = client.place_option_order(option_id=OPTION_ID, side="buy", position_effect="open",
+                                              qty=1, order_type="limit", limit_price=1.0, ref_id=REF_ID)
+        self.assertEqual((order["option_id"], order["side"], order["status"], order["contract_symbol"]),
+                         (OPTION_ID, "buy", "pending", SYMBOL))
+
     def test_review_approval_contract_matches_engine(self):
         transport = FixtureTransport([definition("review_option_order", REVIEW_PROPERTIES)],
                                      {"order_checks": {}})

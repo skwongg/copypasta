@@ -145,9 +145,21 @@ def reconcile(tx, mcp, now):
             raise OrderError('invalid_order_snapshot')
         for order in pending:
             matches = [r for r in rows if r.get('ref_id') == order['ref_id']]
+            matched_by_broker_id = False
+            if not matches and order.get('broker_order_id'):
+                # The broker does not echo our ref_id on order snapshots, so
+                # join on the broker order id we recorded at submission time.
+                matches = [r for r in rows
+                           if r.get('order_id') == order['broker_order_id']]
+                matched_by_broker_id = True
             if len(matches) != 1:
                 raise OrderError('order_outcome_unresolved')
-            tx.data = apply_response(tx.data, order['intent_id'], matches[0], now)
+            row = matches[0]
+            if matched_by_broker_id and row.get('ref_id') is None:
+                # Identity is established by the broker order id; the
+                # snapshot carries no ref_id echo to compare against.
+                row = dict(row, ref_id=order['ref_id'])
+            tx.data = apply_response(tx.data, order['intent_id'], row, now)
             tx.save()
         if tx.data['halt_reason'] == 'unknown_order_outcome' and not any(o['status'] in UNRESOLVED for o in tx.data['orders'].values()):
             tx.data['halt_reason'] = None
