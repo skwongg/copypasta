@@ -31,6 +31,22 @@ def can_fire(context=None, mode='dry_run', account=None):
 is_armed = can_fire
 
 
+def live_accounts(root=None):
+    """Account namespaces that have live state. Local only: no broker call."""
+    base = TradingState(root=root).root / 'live'
+    try:
+        names = sorted(entry.name for entry in os.scandir(base)
+                       if entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'))
+    except OSError:
+        return []
+    return [name for name in names if (base / name / 'state.json').is_file()]
+
+
+def any_live_armed(root=None):
+    """Cheap pre-check the hooks rely on: is any live account armed and not halted?"""
+    return any(can_fire(context=TradingState('live', name, root=root)) for name in live_accounts(root))
+
+
 def arm(context):
     # Live arming is permitted only through the explicit activation review;
     # the ARMED marker is what the entry/exit hooks and the adapter gates check.
@@ -68,7 +84,13 @@ def main(argv=None):
     parser.add_argument('--mode', choices=('dry_run', 'live'), default='dry_run')
     parser.add_argument('--account')
     args = parser.parse_args(argv)
-    ctx = TradingState(args.mode, args.account)
+    account = args.account
+    if args.mode == 'live' and account is None:
+        accounts = live_accounts()
+        if len(accounts) != 1:
+            parser.error('--account is required: found %d live accounts' % len(accounts))
+        account = accounts[0]
+    ctx = TradingState(args.mode, account)
     for action, fn in (('arm', arm), ('disarm', disarm), ('halt', halt), ('reset', reset)):
         if getattr(args, action):
             fn(ctx)

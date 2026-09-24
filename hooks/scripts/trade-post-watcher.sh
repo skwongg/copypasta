@@ -23,15 +23,24 @@ case "$STATUS" in
   alert)
     # Copy-trader: sign the alert JSON (authenticated producer path) and pipe
     # it into the entry engine BEFORE wake — wake does not return, so anything
-    # after it never runs. Only fires while ~/workspace/copy-trader/ARMED
-    # exists (disarmed = text-only alerts). Deployment review complete 2026-09-22;
-    # fire_entries.py --mode live is enabled with all gates active.
-    if [ -f "$HOME/workspace/copy-trader/ARMED" ]; then
-      export COPYTRADER_CONFIG="$HOME/workspace/copy-trader/policy.json"
-      printf '%s' "$RESULT" | python3 "$HOME/workspace/copy-trader/sign_alerts.py" \
-        | "$HOME/workspace/copy-trader/fire_entries.py" --alerts-json /dev/stdin --mode live >>"$HOME/workspace/copy-trader/fire.log" 2>&1 || true
+    # after it never runs. fire_entries.py itself refuses (locally, before any
+    # broker call) unless the live state is armed and not halted; arm/halt with
+    # `python3 ~/workspace/copy-trader/kill.py --mode live --arm|--halt|--disarm|--status`.
+    CT="$HOME/workspace/copy-trader"
+    export COPYTRADER_CONFIG="$CT/policy.json"
+    set +e
+    FIRE_OUT="$(printf '%s' "$RESULT" | python3 "$CT/sign_alerts.py" 2>>"$CT/fire.log" \
+      | python3 "$CT/fire_entries.py" --alerts-json /dev/stdin --mode live 2>>"$CT/fire.log")"
+    FIRE_RC=$?
+    set -e
+    printf '%s\n' "$FIRE_OUT" >>"$CT/fire.log"
+    # fire_entries prints only fixed result codes and validated contract symbols.
+    CT_LINES="$(printf '%s\n' "$FIRE_OUT" | grep '^\[LIVE\]' || true)"
+    if [ "$FIRE_RC" -ne 0 ]; then
+      CT_LINES="did not trade (exit $FIRE_RC: disarmed, halted or broker error; see fire.log)"
     fi
-    wake "new trade posts from @CassyTrades/@clintoptions/@capricekayem" "$RESULT"
+    PAYLOAD="$(printf '%s' "$RESULT" | jq -c --arg ct "$CT_LINES" '. + {copytrader: $ct}' 2>/dev/null || printf '%s' "$RESULT")"
+    wake "new trade posts from @CassyTrades/@clintoptions/@capricekayem/@spylieu" "$PAYLOAD"
     ;;
   ok)
     silent "no new trade posts"

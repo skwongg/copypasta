@@ -103,6 +103,8 @@ def process_entry(alert, mcp, mode='dry_run', *, state=None, policy=None, now=No
             qty = int(Decimal(str(policy.trade_target)) // (limit * 100))
             if qty < 1:
                 return result('blocked', 'trade_exceeds_budget', mode)
+            if verify_broker_positions(tx.data, mcp, now):
+                tx.save()
             exposure = sum(p['qty_remaining'] * p['fill_price'] * 100 for p in tx.data['positions'])
             if exposure + qty * float(limit) * 100 > policy.max_exposure:
                 return result('blocked', 'exposure_limit', mode)
@@ -111,7 +113,6 @@ def process_entry(alert, mcp, mode='dry_run', *, state=None, policy=None, now=No
                            if e['event'] == 'exit_fill' and datetime.fromisoformat(e['ts']).astimezone(config.MARKET_TZ).date() == today)
             if realized <= -policy.daily_loss_cap:
                 return result('blocked', 'daily_loss_limit', mode)
-            verify_broker_positions(tx.data, mcp)
             preview = mcp.review_option_order(option_id=contract.option_id, side='buy',
                                                  position_effect='open', qty=qty,
                                                  order_type='limit', limit_price=float(limit),

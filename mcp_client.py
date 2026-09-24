@@ -891,10 +891,13 @@ class MCPClient:
         contract_symbol = data.get("contract_symbol")
         if contract_symbol is not None and (type(contract_symbol) is not str or not contract_symbol):
             raise MCPError("Invalid order contract symbol")
+        placed_agent, created_at = data.get("placed_agent"), data.get("created_at")
         return {"order_id": order_id, "ref_id": ref_id, "option_id": option_id,
                 "contract_symbol": contract_symbol, "side": side, "quantity": quantity,
                 "status": status, "filled_qty": filled_qty,
-                "avg_fill_price": avg_fill_price}
+                "avg_fill_price": avg_fill_price,
+                "placed_agent": placed_agent if type(placed_agent) is str else None,
+                "created_at": created_at if type(created_at) is str else None}
 
     def _resolve_order_symbol(self, order):
         if order.get("contract_symbol"):

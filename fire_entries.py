@@ -3,7 +3,7 @@
 import argparse
 import json
 import sys
-from config import load_policy
+from config import STATE_LOCK_WAIT_SECONDS, load_policy
 from entry_engine import process_entry
 from notifications import render
 from paper_client import PaperClient
@@ -73,6 +73,11 @@ def live_main(args):
     if not LIVE_TRADING_ENABLED:
         print('Live entry refused: broker adapter is not enabled.', file=sys.stderr)
         return 2
+    # Local arm/kill check before any credential or network access; the
+    # per-account check below is authoritative.
+    if not kill.any_live_armed():
+        print('Live entry refused: not armed or halted.', file=sys.stderr)
+        return 2
     policy = load_policy()
     if not all(policy.sources.values()):
         print('Live entry refused: policy.sources is not configured.', file=sys.stderr)
@@ -83,7 +88,7 @@ def live_main(args):
     if args.account and args.account != account:
         print('Live entry refused: --account does not match the agentic account.', file=sys.stderr)
         return 2
-    state = TradingState('live', account)
+    state = TradingState('live', account, lock_wait=STATE_LOCK_WAIT_SECONDS)
     if not kill.can_fire(context=state):
         print('Live entry refused: not armed or halted.', file=sys.stderr)
         return 2

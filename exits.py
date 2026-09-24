@@ -6,7 +6,8 @@ import time
 import config
 import kill
 from entry_engine import quote_price
-from order_state import UNRESOLVED, OrderError, intent_id, reconcile, submit, verify_broker_positions
+from order_state import (UNRESOLVED, OrderError, cancel_stale_orders, intent_id, reconcile, submit,
+                         verify_broker_positions)
 from trade_state import TradingState, StateError
 
 RUNGS = (('tp50', 1.5), ('tp200', 3.0), ('tp300', 4.0))
@@ -49,9 +50,13 @@ class ExitMonitor:
                 self.mcp.assert_mutation_allowed()
             with self.state.transaction() as tx:
                 reconcile(tx, self.mcp, now)
+                if not tx.data['halt_reason']:
+                    cancel_stale_orders(tx, self.mcp, now, sell_after=config.EXIT_REPRICE_SECONDS,
+                                        buy_after=config.ENTRY_ORDER_TIMEOUT_SECONDS)
                 if tx.data['halt_reason'] or any(o['status'] in UNRESOLVED for o in tx.data['orders'].values()):
                     return [self.note('blocked', 'orders_require_reconciliation')]
-                verify_broker_positions(tx.data, self.mcp)
+                if verify_broker_positions(tx.data, self.mcp, now):
+                    tx.save()
                 for position_id in [p['position_id'] for p in tx.data['positions'] if p['qty_remaining']]:
                     if not kill.can_fire(context=self.state):
                         notifications.append(self.note('blocked', 'not_armed_or_halted'))
@@ -76,7 +81,10 @@ class ExitMonitor:
                         if not kill.can_fire(context=self.state):
                             notifications.append(self.note('blocked', 'not_armed_or_halted'))
                             return notifications
-                        key = intent_id(self.state, f'exit:{position_id}:{rung}')
+                        # A repriced exit is a new order for the same rung.
+                        attempt = sum(1 for o in tx.data['orders'].values()
+                                      if o.get('position_id') == position_id and o.get('rung') == rung)
+                        key = intent_id(self.state, f'exit:{position_id}:{rung}' + (f':{attempt}' if attempt else ''))
                         limit = float(Decimal(str(px)).quantize(Decimal('.01'), rounding=ROUND_DOWN))
                         if limit <= 0:
                             raise OrderError('invalid_exit_limit')

@@ -32,11 +32,16 @@ def live_main(args):
     """Live exit-monitor path. Same gates as entries: adapter switch, ARMED
     marker, configured sources, market hours, kill-switch."""
     from mcp_client import MCPClient, LIVE_TRADING_ENABLED
-    from config import load_policy
+    from config import STATE_LOCK_WAIT_SECONDS, load_policy
     import kill
     # Refuse before touching credentials, input, or the network.
     if not LIVE_TRADING_ENABLED:
         print('Live exits refused: broker adapter is not enabled.', file=sys.stderr)
+        return 2
+    # Local arm/kill check before any credential or network access; the
+    # per-account check below is authoritative.
+    if not kill.any_live_armed():
+        print('Live exits refused: not armed or halted.', file=sys.stderr)
         return 2
     policy = load_policy()
     if not all(policy.sources.values()):
@@ -48,7 +53,7 @@ def live_main(args):
     if args.account and args.account != account:
         print('Live exits refused: --account does not match the agentic account.', file=sys.stderr)
         return 2
-    state = TradingState('live', account)
+    state = TradingState('live', account, lock_wait=STATE_LOCK_WAIT_SECONDS)
     if not kill.can_fire(context=state):
         print('Live exits refused: not armed or halted.', file=sys.stderr)
         return 2

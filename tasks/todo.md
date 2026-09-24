@@ -26,3 +26,17 @@ Design: explicit state context identifies mode and account; a process lock cover
 - Source/runtime limits: actual broker schema, provider idempotency and reconciliation semantics, producer authentication deployment, installed watcher/Hatch hooks, agent permissions, host provenance, and activation remain unverified. Live CLIs, live arming, and transport mutation are deliberately disabled. Existing external hooks were not changed.
 
 Publication: [PR #1](https://github.com/skwongg/copypasta/pull/1) is open and ready for review from `fix/security-audit` into `main`. GitHub confirmed the implementation commit `ccc536f71ec7a5f630d4ce7ff726a37896856dd2`; no workflow is active and there are no remote CI results. The follow-up documentation commit only records this publication evidence. No merge, deployment, OAuth session, or broker access occurred.
+
+# Live exits: reconcile, reprice, broker-as-truth (2026-09-24)
+
+Live account check on 9/24: the bot's entries fired on 9/23 (7x SPY 768P) and 9/24 (15x SPY 769C), but every exit was placed by hand. Robinhood's order rows carry no `ref_id`, so any order that wasn't reported filled in the place response could never reconcile and the account halted.
+
+- [x] Reconcile pending orders by broker order id; for a lost place response, fall back to the single unclaimed agentic order for the same contract/side/qty created after submission. `ref_id` is checked only when the broker echoes it.
+- [x] Broker is the truth for holdings: hand closes/trims become `external_close` events and the rest stays managed. Holdings the bot never bought still block.
+- [x] Each exit sweep cancels a resting exit sell whose limit is above the bid (>=45s old) and re-places it at the current bid, and cancels an entry buy still open after 2 minutes.
+- [x] Arm/kill lives only in the live state dir; the hooks no longer read checkout `ARMED`/`KILL`/`positions.json`. Live CLIs refuse locally before any broker call when disarmed/halted. `kill.py --mode live` finds the account itself.
+- [x] Live CLIs wait up to 30s for the shared state lock instead of dropping the alert.
+- [x] Notifier drains live state; the watcher wake carries the copy-trader result for the chat relay.
+- [x] `tests/test_live_pipeline.py` drives the real CLIs against `tests/fake_robinhood.py` (real Robinhood shapes). 9 of its tests fail on the previous main; 146/146 pass here.
+
+Deploy: copy the checkout and `hooks/` to the host. On the first sweep, a halted `unknown_order_outcome` from a lost place response resolves by itself. `exit_not_completed` still needs a manual look.
