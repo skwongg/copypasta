@@ -261,6 +261,49 @@ class TransportSecurity(unittest.TestCase):
                           norm["side"], norm["avg_fill_price"], norm["ref_id"]),
                          ("filled", 1, 1, "buy", 0.15, None))
 
+    def test_normalize_order_ignores_premium_notional_on_pending(self):
+        # Regression for the 2026-09-24 halt: the broker's place response
+        # arrives in "confirmed" state carrying "premium" (per-contract
+        # notional = price x 100, e.g. 33.00 for a 0.33 fill). It is not a
+        # fill price, so a pending response must parse without halting.
+        row = order_row(state="confirmed", quantity="15.00000",
+                        processed_quantity="0.00000", premium="33.00000000")
+        norm = mcp.MCPClient.normalize_order(row)
+        self.assertEqual((norm["status"], norm["filled_qty"], norm["avg_fill_price"]),
+                         ("pending", 0, None))
+
+    def test_normalize_order_uses_execution_prices_not_premium(self):
+        # The filled 2026-09-24 snapshot: premium "33.00000000" is notional;
+        # the true per-contract fill comes from the leg executions.
+        legs = [{"option_id": OPTION_ID, "side": "buy", "position_effect": "open",
+                 "executions": [{"price": "0.33000000", "quantity": "15.00000"}]}]
+        row = order_row(state="filled", quantity="15.00000",
+                        processed_quantity="15.00000", premium="33.00000000",
+                        legs=legs)
+        norm = mcp.MCPClient.normalize_order(row)
+        self.assertEqual(norm["avg_fill_price"], 0.33)
+        # Multi-execution fills weight by quantity (the 2026-09-23 2+5 split).
+        legs = [{"option_id": OPTION_ID, "side": "buy", "position_effect": "open",
+                 "executions": [{"price": "0.68000000", "quantity": "2.00000"},
+                                {"price": "0.68000000", "quantity": "5.00000"}]}]
+        row = order_row(state="filled", quantity="7.00000",
+                        processed_quantity="7.00000", premium="68.00000000",
+                        legs=legs)
+        norm = mcp.MCPClient.normalize_order(row)
+        self.assertAlmostEqual(norm["avg_fill_price"], 0.68)
+
+    def test_place_option_order_attaches_raw_shape_on_parse_failure(self):
+        # When the parser rejects a place response, the raw shape rides on
+        # the exception so the halt can record a diagnostic fingerprint.
+        result = dict(order_row(), state="bogus-state")
+        transport = FixtureTransport([definition("place_option_order", ORDER_PROPERTIES)], result)
+        client = mcp.MCPClient(mode="live", account_number="TEST", transport=transport, mutation_guard=lambda: True)
+        with patch.object(mcp, "LIVE_TRADING_ENABLED", True):
+            with self.assertRaises(mcp.MCPError) as ctx:
+                client.place_option_order(option_id=OPTION_ID, side="buy", position_effect="open",
+                                          qty=1, order_type="limit", limit_price=1.0, ref_id=REF_ID)
+        self.assertEqual(ctx.exception.raw_response["state"], "bogus-state")
+
     def test_fresh_kill_check_after_token_and_before_http_dispatch(self):
         allowed = [True]
         def token():

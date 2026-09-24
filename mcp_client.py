@@ -123,6 +123,36 @@ def _parse_int(value):
     return number
 
 
+def _execution_avg_price(data):
+    """Weighted average per-contract fill price from leg executions.
+
+    Returns None when no usable executions exist. The broker's top-level
+    "premium" field is per-contract notional (price x 100) and must never
+    be read as a per-contract price: on 2026-09-23/24 it arrived as 33.00
+    for a 0.33 fill, which both faked a fill price and failed unfilled
+    responses, halting two live trades.
+    """
+    try:
+        legs = data.get("legs")
+        if not isinstance(legs, list) or not legs or not isinstance(legs[0], dict):
+            return None
+        total_qty, total_px_qty = 0, 0.0
+        for execution in legs[0].get("executions") or []:
+            if not isinstance(execution, dict):
+                return None
+            qty = _parse_int(execution.get("quantity"))
+            price = _parse_price(execution.get("price"))
+            if qty <= 0:
+                return None
+            total_qty += qty
+            total_px_qty += price * qty
+        if total_qty <= 0:
+            return None
+        return total_px_qty / total_qty
+    except MCPError:
+        return None
+
+
 def _occ_symbol(chain_symbol, expiration_date, option_type, strike_price):
     """Construct the OCC option symbol from instrument fields.
 
@@ -800,7 +830,9 @@ class MCPClient:
         Normalized shape: {"order_id", "ref_id", "option_id", "contract_symbol",
         "side", "quantity", "status", "filled_qty", "avg_fill_price"}.
         Place/cancel responses nest the order under "order" (verified against a
-        real fill on 2026-09-22); order-list rows arrive flat. Anything
+        real fill on 2026-09-22); order-list rows arrive flat. The top-level
+        "premium" is per-contract notional (price x 100) and is never a fill
+        price; per-contract fills come from leg executions. Anything
         unexpected fails closed here.
         """
         data = _unwrap_envelope(data)
@@ -828,10 +860,14 @@ class MCPClient:
         if not 0 <= filled_qty <= quantity:
             raise MCPError("Invalid cumulative fill quantity")
         avg_fill_price = None
-        for key in ("avg_fill_price", "average_price", "filled_price", "premium"):
+        for key in ("avg_fill_price", "average_price", "filled_price"):
             if data.get(key) not in (None, ""):
                 avg_fill_price = _parse_price(data[key])
                 break
+        if avg_fill_price is None:
+            # Fall back to per-execution contract prices. Never use the
+            # top-level "premium": it is price x 100 (33.00 for a 0.33 fill).
+            avg_fill_price = _execution_avg_price(data)
         if filled_qty > 0 and not (avg_fill_price is not None and avg_fill_price > 0):
             raise MCPError("Filled order missing a valid fill price")
         if filled_qty == 0 and avg_fill_price not in (None, 0):
@@ -874,7 +910,14 @@ class MCPClient:
         args = self._review_or_place_args(option_id, side, position_effect, qty,
                                           order_type, limit_price, time_in_force)
         args["ref_id"] = ref_id
-        result = self.normalize_order(self.call_tool(self._tool_for("place_option_order"), args))
+        raw = self.call_tool(self._tool_for("place_option_order"), args)
+        try:
+            result = self.normalize_order(raw)
+        except MCPError as exc:
+            # Attach the raw shape so callers can record a diagnostic
+            # fingerprint (keys/types only) instead of halting blind.
+            exc.raw_response = raw
+            raise
         if "account_number" in result and result["account_number"] != self.account_number:
             raise MCPError("Order response account mismatch; reconciliation required")
         if (result["ref_id"] is not None and result["ref_id"] != ref_id):
@@ -890,8 +933,13 @@ class MCPClient:
     def cancel_order(self, order_id):
         self._mutation_allowed()
         _uuid(order_id, "order_id")
-        result = self.normalize_order(self.call_tool(self._tool_for("cancel_order"),
-                                                     dict(self._account_args(), order_id=order_id)))
+        raw = self.call_tool(self._tool_for("cancel_order"),
+                             dict(self._account_args(), order_id=order_id))
+        try:
+            result = self.normalize_order(raw)
+        except MCPError as exc:
+            exc.raw_response = raw
+            raise
         if result["order_id"] != order_id:
             raise MCPError("Cancel response order mismatch; reconciliation required")
         return self._resolve_order_symbol(result)

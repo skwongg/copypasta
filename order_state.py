@@ -238,14 +238,19 @@ def submit(tx, store, mcp, order, now, *, paper_price, validate=None):
         tx.data = apply_response(tx.data, key, response, now)
         tx.save()
         return tx.data['orders'][key]
-    except Exception:
+    except Exception as exc:
         if tx.data['orders'][key]['status'] != 'rejected':
             tx.data['orders'][key]['status'] = 'unknown'
             tx.data['halt_reason'] = 'unknown_order_outcome'
-            if response is not None:
+            # Prefer the raw broker shape (attached by place/cancel when the
+            # parser rejects it); fall back to the normalized response.
+            raw = getattr(exc, 'raw_response', None)
+            if raw is None:
+                raw = response
+            if raw is not None:
                 # Capture the shape the parser could not read (keys/types only,
                 # never values) so the halt is diagnosable, not a mystery.
                 event(tx.data, 'unparseable_order_response', now, intent_id=key,
-                      fingerprint=_response_fingerprint(response))
+                      fingerprint=_response_fingerprint(raw))
             tx.save()
         raise OrderError('order_outcome_unresolved') from None
