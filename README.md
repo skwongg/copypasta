@@ -1,8 +1,8 @@
 # Copypasta
 
-Copypasta parses allowlisted trade alerts and simulates options entries and an exit ladder using explicitly supplied local market data. This revision repairs defects found in the September 2026 audit and is ready for code review and offline testing.
+Copypasta copies options entries from allowlisted X accounts into a dedicated Robinhood agentic account and manages them with a stop-loss and take-profit ladder. It also runs as a paper simulator against explicitly supplied local market data.
 
-**Live trading is disabled. Do not connect this revision to a trading-capable agent or deploy the old watcher instructions.** The broker adapter and external deployment have not been verified. Passing the offline tests is not authorization or evidence that real orders are safe. See [SECURITY.md](SECURITY.md) for the remaining gates.
+**Live trading is enabled** (`LIVE_TRADING_ENABLED = True` since 2026-09-22) and deployed through the hooks in `hooks/`. Real orders are placed whenever the live state is armed and not halted. See [State and operational controls](#state-and-operational-controls) for arming and halting, and [SECURITY.md](SECURITY.md) for the remaining gates.
 
 ## What runs now
 
@@ -18,7 +18,11 @@ Paper execution does not obtain OAuth tokens or contact Robinhood. The CLI requi
 
 The entry engine checks alert age/source policy, replay reservations, exact contract identity, fresh quotes, a 10% maximum chase cap, a per-trade budget, open exposure, and daily realized loss. The parser treats unsupported or ambiguous text as requiring review. An alert marked `type: "entry"` does not bypass these checks.
 
-The exit monitor uses the quote's executable bid. It attempts half of remaining contracts at +50%, half of the then-remaining contracts at +200%, and the remainder at +300%; fractional contracts are rounded down. A bid at or below 40% of the entry fill triggers the remaining-position stop. Exits use limits rounded down to cents. These are polling decisions, **not broker-native protective orders**; a stop trigger or submitted limit does not guarantee execution.
+The exit monitor uses the quote's executable bid. It attempts half of remaining contracts at +50%, half of the then-remaining contracts at +200%, and the remainder at +300%; fractional contracts are rounded down. A bid at or below 40% of the entry fill triggers the remaining-position stop. Take-profits are a fixed ladder: once the bid reaches a rung, the sell limit is the rung price itself (1.5x / 3x / 4x the entry fill, rounded up to the contract's tick) and it never moves. The stop-loss sells at the bid rounded down to cents. These are polling decisions, **not broker-native protective orders**; a stop trigger or submitted limit does not guarantee execution.
+
+Resting orders are managed on every sweep. A stop-loss sell still open after 45 seconds with the bid below its limit is canceled and re-placed at the current bid. A take-profit resting at its rung is left alone and does not block the account, but when the stop triggers it cancels that position's resting take-profits first and then sells everything at the bid. An entry buy still open after two minutes is canceled. Pending orders are matched to the broker by broker order id; Robinhood's order list does not return `ref_id`.
+
+The broker is the truth for holdings. Contracts closed or trimmed by hand in the agentic account are recorded as `external_close` events and the remainder stays managed. Holdings the bot never bought, or more than it bought, still stop all mutations until reviewed.
 
 ## Run the isolated tests
 
@@ -109,6 +113,8 @@ Default state lives outside the checkout under:
 
 Order intents are saved before submission. Pending, partial, and unknown outcomes reserve their identity and stop further submissions until reconciled. Holdings, exit latches, and realized P&L change only from confirmed cumulative fills; a timeout is not a rejection or a reason to resubmit. Normalized broker responses must preserve the order's contract, side, quantity, and client idempotency identifier.
 
+Arm, halt and check the live account with `python3 kill.py --mode live --arm|--halt|--disarm|--reset|--status`; `--account` is optional when exactly one live account has state. These markers in the state directory are the only switches: the hooks no longer read `ARMED`, `KILL` or `positions.json` in the checkout.
+
 `--halt` creates `KILL`; `--disarm` removes `ARMED`. Both stop new entries **and automated exits**. They do not cancel orders already submitted, liquidate positions, or ensure flat holdings. Existing orders and holdings need manual monitoring. `--reset` only clears the kill marker: it does not resolve unknown orders or clear durable reconciliation halts. If the arm marker remains, clearing `KILL` restores eligibility for otherwise valid paper work.
 
 Legacy `positions.json`, `ledger.jsonl`, notification queues, and checkout-level markers are never automatically imported. Do not copy mixed paper/live history into the new state. Any eventual live migration needs separate broker reconciliation and review.
@@ -127,7 +133,7 @@ The OAuth implementation accepts only pinned HTTPS endpoints, refuses redirects,
 
 The MCP adapter allows exact named tools and validates a conservative schema subset. Unknown tools, unsupported schemas, tool errors, response-ID mismatches, and malformed fills fail closed. Its normalized argument/result shapes are **offline contracts, not verified Robinhood account schemas**. An advertised tool name alone does not establish compatibility or permission.
 
-Live execution has independent blocks in the entry/exit CLIs, live arming, and the transport's source-level `LIVE_TRADING_ENABLED = False` gate. There is no environment override or supported live-enable command. Removing one check is not a rollout procedure. Conditional-order support remains unavailable.
+Live execution is gated by the transport's source-level `LIVE_TRADING_ENABLED` switch, the live state's `ARMED`/`KILL` markers (checked before any credential or network access and again before each order), the source allowlist, signed alerts and market hours. Conditional-order support remains unavailable.
 
 ## Files
 

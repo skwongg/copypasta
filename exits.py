@@ -1,12 +1,13 @@
 """Confirmed-fill exit ladder. All operations hold the account's process lock."""
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 import time
 
 import config
 import kill
 from entry_engine import quote_price
-from order_state import UNRESOLVED, OrderError, intent_id, reconcile, submit, verify_broker_positions
+from order_state import (UNRESOLVED, OrderError, blocking_orders, cancel_orders, cancel_stale_orders, intent_id,
+                         is_resting_take_profit, reconcile, submit, verify_broker_positions)
 from trade_state import TradingState, StateError
 
 RUNGS = (('tp50', 1.5), ('tp200', 3.0), ('tp300', 4.0))
@@ -22,6 +23,13 @@ def place_conditional_exits(mcp, position):
 
 def open_positions(state=None):
     return [p for p in (state or TradingState()).snapshot()['positions'] if p['qty_remaining'] > 0]
+
+
+def rung_limit(fill_price, multiple, tick):
+    """The take-profit's fixed limit: the rung price rounded up to a valid tick."""
+    tick = Decimal(str(tick))
+    rung = Decimal(str(fill_price)) * Decimal(str(multiple))
+    return float((rung / tick).to_integral_value(rounding=ROUND_CEILING) * tick)
 
 
 class ExitMonitor:
@@ -49,9 +57,14 @@ class ExitMonitor:
                 self.mcp.assert_mutation_allowed()
             with self.state.transaction() as tx:
                 reconcile(tx, self.mcp, now)
-                if tx.data['halt_reason'] or any(o['status'] in UNRESOLVED for o in tx.data['orders'].values()):
+                if not tx.data['halt_reason']:
+                    cancel_stale_orders(tx, self.mcp, now, sell_after=config.EXIT_REPRICE_SECONDS,
+                                        buy_after=config.ENTRY_ORDER_TIMEOUT_SECONDS)
+                # A take-profit resting at its rung doesn't block; its stop must still run.
+                if tx.data['halt_reason'] or blocking_orders(tx.data):
                     return [self.note('blocked', 'orders_require_reconciliation')]
-                verify_broker_positions(tx.data, self.mcp)
+                if verify_broker_positions(tx.data, self.mcp, now):
+                    tx.save()
                 for position_id in [p['position_id'] for p in tx.data['positions'] if p['qty_remaining']]:
                     if not kill.can_fire(context=self.state):
                         notifications.append(self.note('blocked', 'not_armed_or_halted'))
@@ -63,8 +76,17 @@ class ExitMonitor:
                     quote_now = now + timedelta(seconds=max(0, time.monotonic() - started))
                     px = quote_price(quote, 'bid', quote_now, symbol)
                     ratio = px / position['fill_price']
+                    resting = [o['intent_id'] for o in tx.data['orders'].values()
+                               if o.get('position_id') == position_id and is_resting_take_profit(o)]
+                    if ratio <= .40 and resting:
+                        # The stop overrides: pull the take-profits, then sell everything at the bid.
+                        if cancel_orders(tx, self.mcp, now, resting):
+                            notifications.append(self.note('pending', 'order_pending', contract_symbol=symbol))
+                            return notifications
+                    elif resting:
+                        continue  # take-profits hold as placed; contracts are reserved at the broker
                     triggered = [('sl', 0)] if ratio <= .40 else [(r, t) for r, t in RUNGS if ratio >= t]
-                    for rung, _ in triggered:
+                    for rung, multiple in triggered:
                         position = next(p for p in tx.data['positions'] if p['position_id'] == position_id)
                         if position['latches'][rung] or not position['qty_remaining']:
                             continue
@@ -76,8 +98,20 @@ class ExitMonitor:
                         if not kill.can_fire(context=self.state):
                             notifications.append(self.note('blocked', 'not_armed_or_halted'))
                             return notifications
-                        key = intent_id(self.state, f'exit:{position_id}:{rung}')
-                        limit = float(Decimal(str(px)).quantize(Decimal('.01'), rounding=ROUND_DOWN))
+                        # A repriced exit is a new order for the same rung.
+                        attempt = sum(1 for o in tx.data['orders'].values()
+                                      if o.get('position_id') == position_id and o.get('rung') == rung)
+                        key = intent_id(self.state, f'exit:{position_id}:{rung}' + (f':{attempt}' if attempt else ''))
+                        if rung == 'sl':
+                            limit = float(Decimal(str(px)).quantize(Decimal('.01'), rounding=ROUND_DOWN))
+                        else:
+                            # Take-profits sell at the exact rung price, never below it.
+                            price_tick = getattr(self.mcp, 'price_tick', None)
+                            rung_price = position['fill_price'] * multiple
+                            tick = price_tick(position['option_id'], rung_price) if price_tick else 0.01
+                            limit = rung_limit(position['fill_price'], multiple, tick)
+                            if limit > px:
+                                continue
                         if limit <= 0:
                             raise OrderError('invalid_exit_limit')
                         preview = self.mcp.review_option_order(option_id=position['option_id'],
@@ -106,6 +140,8 @@ class ExitMonitor:
                                                        'order_' + order['status'], contract_symbol=symbol,
                                                        qty=order['filled_qty'], fill_price=order['avg_fill_price']))
                         if order['status'] != 'filled':
+                            if is_resting_take_profit(order):
+                                break  # rests at its rung; other positions still get checked
                             return notifications
         except StateError:
             notifications.append(self.note('blocked', 'state_unavailable_or_corrupt'))

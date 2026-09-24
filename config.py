@@ -18,6 +18,14 @@ MAX_QUOTE_AGE_SECONDS = 30
 # seconds of future-dating so fresh quotes are not rejected as invalid.
 # 2026-09-23: ~1s broker clock skew blocked every live quote check.
 MAX_QUOTE_SKEW_SECONDS = 5
+# Resting limit orders. An exit sell still open after this many seconds is
+# canceled and re-placed at the current bid on the next sweep (~60s cadence);
+# an entry buy still open after ENTRY_ORDER_TIMEOUT_SECONDS is canceled.
+EXIT_REPRICE_SECONDS = 45
+ENTRY_ORDER_TIMEOUT_SECONDS = 120
+# How long a live CLI waits for the other one (entry vs exit sweep) to
+# release the account's state lock before giving up.
+STATE_LOCK_WAIT_SECONDS = 30
 TRADERS = {'cassytrades': '0DTE', 'clintoptions': None, 'capricekayem': None, 'spylieu': None}
 MARKET_HOLIDAYS = {
     '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25', '2026-06-19',

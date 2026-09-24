@@ -668,6 +668,21 @@ class MCPClient:
         self._instrument_cache[option_id] = matches[0]
         return matches[0]
 
+    def price_tick(self, option_id, price):
+        """Minimum price increment for a limit at ``price`` on this contract.
+
+        From the instrument's min_ticks: below_tick under cutoff_price,
+        above_tick at or over it (e.g. $0.01 under $3, $0.05 above).
+        """
+        ticks = self._get_instrument(option_id).get("min_ticks")
+        if not isinstance(ticks, dict):
+            raise MCPError("Option instrument has no tick schedule")
+        cutoff = _parse_price(ticks.get("cutoff_price"))
+        tick = _parse_price(ticks.get("above_tick" if price >= cutoff else "below_tick"))
+        if not tick > 0:
+            raise MCPError("Invalid option tick size")
+        return tick
+
     def _occ_for_option(self, option_id):
         item = self._get_instrument(option_id)
         return _occ_symbol(item.get("chain_symbol"), item.get("expiration_date"),
@@ -901,10 +916,13 @@ class MCPClient:
         contract_symbol = data.get("contract_symbol")
         if contract_symbol is not None and (type(contract_symbol) is not str or not contract_symbol):
             raise MCPError("Invalid order contract symbol")
+        placed_agent, created_at = data.get("placed_agent"), data.get("created_at")
         return {"order_id": order_id, "ref_id": ref_id, "option_id": option_id,
                 "contract_symbol": contract_symbol, "side": side, "quantity": quantity,
                 "status": status, "filled_qty": filled_qty,
-                "avg_fill_price": avg_fill_price}
+                "avg_fill_price": avg_fill_price,
+                "placed_agent": placed_agent if type(placed_agent) is str else None,
+                "created_at": created_at if type(created_at) is str else None}
 
     def _resolve_order_symbol(self, order):
         if order.get("contract_symbol"):

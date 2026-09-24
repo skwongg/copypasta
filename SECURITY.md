@@ -1,6 +1,6 @@
 # Security status
 
-**This revision is for offline verification and review. Live trading remains disabled.** The code changes address the repository defects identified in the September 21, 2026 audit of commit `bd90d8cc5b2d369c9a502bc9c6d82cfbb948d812`, including Muse's three parser reproductions. They do not certify the host, outside agents, deployed hooks, or a real broker integration.
+**Live trading was enabled on 2026-09-22 after this audit (see README); the text below describes the audited offline revision.** The code changes address the repository defects identified in the September 21, 2026 audit of commit `bd90d8cc5b2d369c9a502bc9c6d82cfbb948d812`, including Muse's three parser reproductions. They do not certify the host, outside agents, deployed hooks, or a real broker integration.
 
 The original repository review found no obvious malware or deliberate prompt-injection payload. That conclusion is limited to the inspected source/history. It does not establish absence of malware in the external runtime or make untrusted alert text authoritative.
 

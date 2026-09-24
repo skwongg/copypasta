@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -213,7 +214,7 @@ class _Transaction:
 
 
 class TradingState:
-    def __init__(self, mode="dry_run", account=None, root=None):
+    def __init__(self, mode="dry_run", account=None, root=None, lock_wait=0):
         if mode not in ("dry_run", "live"):
             raise StateError("mode must be dry_run or live")
         if account is None:
@@ -223,6 +224,7 @@ class TradingState:
         if type(account) is not str or not _ACCOUNT_RE.fullmatch(account):
             raise StateError("account identifier is not a safe namespace")
         self.mode, self.account = mode, account
+        self.lock_wait = lock_wait
         self.root = Path(root if root is not None else os.environ.get("COPYTRADER_STATE_DIR", "~/.local/state/copypasta")).expanduser()
         self.directory = self.root / mode / account
         self.path = self.directory / "state.json"
@@ -244,10 +246,16 @@ class TradingState:
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
                 raise StateError("invalid state lock file")
             os.fchmod(lock_fd, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise StateBusy("another process holds this state transaction") from exc
+            deadline = time.monotonic() + self.lock_wait
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    # The entry and exit CLIs share this lock; wait out the other one.
+                    if time.monotonic() >= deadline:
+                        raise StateBusy("another process holds this state transaction") from exc
+                    time.sleep(0.2)
             yield directory_fd
         except OSError as exc:
             raise StateError("cannot lock trading state") from exc

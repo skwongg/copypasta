@@ -63,7 +63,14 @@ def main(argv=None):
     parser.add_argument('--mode', choices=('dry_run', 'live'), default='dry_run')
     parser.add_argument('--account')
     args = parser.parse_args(argv)
-    drain(TradingState(args.mode, args.account))
+    account = args.account
+    if args.mode == 'live' and account is None:
+        from kill import live_accounts
+        accounts = live_accounts()
+        if len(accounts) != 1:
+            parser.error('--account is required: found %d live accounts' % len(accounts))
+        account = accounts[0]
+    drain(TradingState(args.mode, account))
 
 
 if __name__ == '__main__':
