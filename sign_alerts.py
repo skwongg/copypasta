@@ -31,8 +31,6 @@ DEFAULT_KEY_PATH = os.path.expanduser("~/.local/share/copypasta/source_key")
 SOURCE_IDS = {
     "cassytrades": "cassytrades",
     "clintoptions": "clintoptions",
-    "capricekayem": "capricekayem",
-    "spylieu": "spylieu",
 }
 
 

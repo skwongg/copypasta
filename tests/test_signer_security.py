@@ -23,8 +23,7 @@ import sign_alerts
 
 NOW = datetime(2026, 9, 22, 16, 0, 0, tzinfo=timezone.utc)
 KEY = bytes.fromhex("ab" * 32)
-SOURCE_IDS = {"cassytrades": "cassytrades", "clintoptions": "clintoptions",
-              "capricekayem": "capricekayem", "spylieu": "spylieu"}
+SOURCE_IDS = {"cassytrades": "cassytrades", "clintoptions": "clintoptions"}
 
 
 def policy(sources=None, key=KEY):
